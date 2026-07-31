@@ -85,6 +85,7 @@
 //! | [`diagnostics`] | J1939-73 | DM1/DM2 trouble codes and lamp status |
 //! | [`memory_access`] | J1939-73 | DM14/DM15/DM16 memory read, write, and data transfer |
 //! | [`identification`] | J1939-71 | Software, ECU, and component identification |
+//! | [`proprietary`] | J1939-21 | Manufacturer-specific Proprietary A and B groups |
 //! | [`request`] | J1939-21 | The Request and Acknowledgement parameter groups |
 //! | [`can`] | — | Bridge to the [`embedded_can`] traits |
 //!
@@ -119,6 +120,7 @@ pub mod identification;
 pub mod memory_access;
 pub mod name;
 pub mod pgn;
+pub mod proprietary;
 pub mod request;
 pub mod tp;
 pub mod types;

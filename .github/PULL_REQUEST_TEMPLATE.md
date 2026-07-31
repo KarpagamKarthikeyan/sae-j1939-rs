@@ -17,12 +17,12 @@ Briefly describe the change and link the issue it addresses (e.g. `Closes #12`).
 - [ ] New wire-format codecs assert against known-good bytes
 - [ ] Public API changes are documented (doc comment; a doctest if it helps)
 
-## Licensing
+## Code provenance
 
-- [ ] This work is my own, and I have **not** copied from or studied the internals
-      of any copyleft-licensed J1939 implementation (see
-      [CONTRIBUTING.md](../CONTRIBUTING.md#licensing-hygiene--please-read))
-- [ ] If derived from another source, I've named it above so the license can be
+- [ ] This work is my own, or adapted from a source whose license is compatible
+      with MIT/Apache-2.0 (see
+      [CONTRIBUTING.md](../CONTRIBUTING.md#code-provenance--please-read))
+- [ ] If adapted from another source, I've named it above so the license can be
       checked
 
 ## Notes for reviewers

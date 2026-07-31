@@ -37,21 +37,23 @@ By signing off you certify the DCO. PRs whose commits aren't signed off can't be
 merged. To fix an existing commit: `git commit --amend -s` (or
 `git rebase --signoff` for several).
 
-## Licensing hygiene — please read
+## Code provenance — please read
 
-This project is deliberately **permissively licensed (MIT OR Apache-2.0)** so that
-companies can embed it in proprietary firmware. Protecting that requires one rule:
+This project is licensed **MIT OR Apache-2.0**, and we need every line in it to
+be safe to distribute under those terms. So, one rule:
 
-> **Do not read, port, or copy from GPL- or otherwise copyleft-licensed J1939
-> implementations** when writing code for this project. In particular, do not
-> study the internals of the GPL-3.0 `j1939` crate
-> ([yorickdewid/J1939](https://github.com/yorickdewid/J1939)).
+> **Contribute only code you wrote yourself, or code whose license is compatible
+> with MIT/Apache-2.0 — and say where it came from.**
 
-Our design references are the MIT-licensed
+If a change is adapted from another project, a datasheet, a vendor SDK, or
+generated from a source you did not write, note that in the pull request so the
+license can be checked before merging. If you are unsure whether something is
+compatible, ask in the issue first; it is much easier to answer beforehand than
+to untangle afterwards.
+
+Our own references are the SAE J1939 standard documents and the MIT-licensed
 [Open-SAE-J1939](https://github.com/DanielMartensson/Open-SAE-J1939) C
-implementation and the public structure of the SAE J1939 standard. If you
-contribute code derived from any other source, say so in the PR so we can check
-the license before merging.
+implementation, used for structure and for known-good frames.
 
 ## Building and testing
 

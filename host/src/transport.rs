@@ -33,6 +33,13 @@ use socketcan::{CanFrame, CanSocket, Socket};
 use sae_j1939_rs::can::{decode, encode};
 use sae_j1939_rs::frame::Frame;
 use sae_j1939_rs::tp::{Reassembler, Rx, TpCm, TpDt, MAX_MESSAGE_SIZE};
+
+/// How many peers may have a multi-packet transfer in flight at once.
+///
+/// A host has memory to spare, so this is generous: several ECUs broadcasting
+/// diagnostics at the same time is routine on a busy bus, and a transfer that
+/// gets no slot is refused rather than corrupting another.
+pub const CONCURRENT_TRANSFERS: usize = 8;
 use sae_j1939_rs::{pgn, Address, Id, Pgn, Priority};
 
 /// A whole J1939 message, however many CAN frames it took to arrive.
@@ -51,7 +58,7 @@ pub struct Message {
 #[derive(Debug)]
 pub struct SocketCan {
     socket: CanSocket,
-    reassembler: Reassembler<{ MAX_MESSAGE_SIZE as usize }>,
+    reassembler: Reassembler<{ MAX_MESSAGE_SIZE as usize }, CONCURRENT_TRANSFERS>,
 }
 
 impl SocketCan {
@@ -135,6 +142,10 @@ impl SocketCan {
     /// call blocks until a whole message is available — sending the CTS and
     /// end-of-message acknowledgements an RTS/CTS transfer needs along the way.
     ///
+    /// Up to [`CONCURRENT_TRANSFERS`] peers may be mid-transfer at once, so
+    /// interleaved broadcasts from different ECUs are reassembled independently
+    /// rather than corrupting one another.
+    ///
     /// `this_ecu` is the address of the local node: TP frames addressed
     /// elsewhere are ignored, and it is used as the source address of any
     /// acknowledgement sent back.
@@ -206,6 +217,19 @@ impl SocketCan {
         let id = Id::from_parts(Priority::LOWEST, pgn::TP_CM, destination, source)
             .map_err(invalid_input)?;
         self.send(id, &cm.encode())
+    }
+
+    /// How many multi-packet transfers are currently being reassembled.
+    pub fn transfers_in_flight(&self) -> usize {
+        self.reassembler.active_sessions()
+    }
+
+    /// Abandon the partially received transfer from `source`, if any.
+    ///
+    /// Use this when a peer goes quiet mid-transfer: J1939-21 allows 750 ms
+    /// between packets, and this type owns no timer.
+    pub fn abandon_transfer(&mut self, source: Address) -> bool {
+        self.reassembler.abandon(source)
     }
 
     /// Send a transport-protocol data packet to `destination`.

@@ -134,7 +134,8 @@ impl Pgn {
     /// or the widely used data-page-1 mirror `0x01FF00..=0x01FFFF`).
     pub const fn is_proprietary_b(self) -> bool {
         let raw = self.0;
-        (raw >= 0x00FF00 && raw <= 0x00FFFF) || (raw >= 0x01FF00 && raw <= 0x01FFFF)
+        (raw >= PROPRIETARY_B_START.0 && raw <= PROPRIETARY_B_END.0)
+            || (raw >= PROPRIETARY_B2_START.0 && raw <= PROPRIETARY_B2_END.0)
     }
 }
 
@@ -191,6 +192,15 @@ pub const PROPRIETARY_B_START: Pgn = Pgn::new_masked(0x00FF00);
 
 /// Last PGN of the Proprietary B broadcast range.
 pub const PROPRIETARY_B_END: Pgn = Pgn::new_masked(0x00FFFF);
+
+/// First PGN of the data-page-1 mirror of the Proprietary B range.
+///
+/// Not defined by the standard, but common enough in the field that decoders
+/// have to recognise it.
+pub const PROPRIETARY_B2_START: Pgn = Pgn::new_masked(0x01FF00);
+
+/// Last PGN of the data-page-1 mirror of the Proprietary B range.
+pub const PROPRIETARY_B2_END: Pgn = Pgn::new_masked(0x01FFFF);
 
 /// DM1 (J1939-73) — active diagnostic trouble codes.
 pub const DM1: Pgn = Pgn::new_masked(0x00FECA);

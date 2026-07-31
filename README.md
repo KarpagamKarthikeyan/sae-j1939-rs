@@ -17,18 +17,24 @@ construction equipment, and marine engines.
 
 ## Why
 
-There is exactly one broadly complete J1939 crate in the Rust ecosystem, and it
-is **GPL-3.0-only**. That is a hard blocker for the audience that matters here:
-a company shipping firmware containing GPL-3.0 code must release that firmware's
-source under GPL-3.0 too, which no commercial embedded team will accept.
+J1939 is more than a frame format. A useful stack has to reassemble multi-packet
+messages, negotiate an address with the other ECUs on the bus, and speak the
+diagnostic parameter groups a service tool expects — and it has to do all of that
+on a microcontroller with no allocator, as well as on a laptop.
 
-Every permissively licensed alternative stops at frame or field-level decoding —
-identifier parsing, a partial SPN table — with no transport protocol, no address
-claiming, and no diagnostics.
+`sae-j1939-rs` is built for both from the same source:
 
-`sae-j1939-rs` closes that gap: a **complete** J1939 stack under a **permissive
-dual MIT/Apache-2.0 license**, so it can be embedded in proprietary firmware
-without contaminating it.
+- **The whole protocol, not just the identifier.** The transport protocol in both
+  directions, address claiming, diagnostics, and identification.
+- **`no_std` and allocation-free.** The core compiles for bare metal, holds no
+  hidden buffers, and lets you set both the largest message an ECU will accept
+  and how many peers may be mid-transfer at once — so its memory use is a
+  number you choose, not a surprise.
+- **Sans-I/O.** The state machines consume and produce frames and own no clock,
+  so they are deterministic and testable, and the same code runs on an MCU and
+  on a host.
+- **Permissively licensed.** Dual MIT/Apache-2.0, so it fits commercial and
+  open-source projects alike.
 
 ## What works today
 
@@ -38,10 +44,13 @@ without contaminating it.
 | PGN model with correct PDU1/PDU2 handling, well-known PGN constants | -21 | ✅ |
 | Destination vs. group-extension disambiguation; ECU receive filter | -21 | ✅ |
 | **Transport Protocol: BAM + RTS/CTS/EOM, receive *and* transmit, to 1785 bytes** | -21 | ✅ |
+| Concurrent transfers from multiple peers; `T1` session timeouts | -21 | ✅ |
 | Connection abort with the standard reason codes | -21 | ✅ |
+| **Proprietary A and B** manufacturer-specific groups | -21 | ✅ |
 | **NAME** (64-bit ECU identity, all nine fields) | -81 | ✅ |
 | **Address claiming**: contention, defence, relocation, commanded address | -81 | ✅ |
 | **DM1 / DM2**: lamp status + trouble codes (SPN/FMI/occurrence) | -73 | ✅ |
+| **DM3**: clear previously active trouble codes | -73 | ✅ |
 | `embedded-can` bridge + SocketCAN transport with message reassembly | — | ✅ |
 | **Request and Acknowledgement** parameter groups | -21 | ✅ |
 | **DM14/DM15/DM16**: memory read, write, and binary data transfer | -73 | ✅ |
@@ -115,6 +124,7 @@ use sae_j1939_rs::{pgn, Address};
 
 let mut rx = Reassembler::<256>::new();          // this ECU accepts up to 256 bytes
 let sender = Address::new(0x80);
+// (`Reassembler::<1785, 8>` would track eight peers at once, for a host.)
 
 rx.on_tp_cm(sender, &TpCm::bam(12, pgn::DM1)?);  // BAM: 12 bytes coming
 rx.on_tp_dt(sender, &TpDt::new(1, &[1, 2, 3, 4, 5, 6, 7]));
@@ -246,6 +256,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 | `name` | -81 | The 64-bit ECU NAME |
 | `address_claim` | -81 | Claiming, defending, and relocating an address |
 | `request` | -21 | The Request and Acknowledgement parameter groups |
+| `proprietary` | -21 | Manufacturer-specific Proprietary A and B groups |
 | `diagnostics` | -73 | DM1/DM2 trouble codes and lamp status |
 | `memory_access` | -73 | DM14/DM15/DM16 memory read, write, and data transfer |
 | `identification` | -71 | Software, ECU, and component identification |
@@ -264,24 +275,22 @@ This mirrors the split in [`canopen-rs`], its companion project for industrial
 automation. Both sit on `embedded-can` and target the same physical CAN bus, so
 the two transport layers are designed to converge on shared code.
 
-## References studied (not copied)
+## References
 
-- [Open-SAE-J1939] — a complete, MIT-licensed C implementation covering the
-  transport protocol, diagnostics, network management, and ISO 11783. Our
-  primary design reference; studied for structure and logic, not copied.
-- The **SAE J1939** standard documents (sold by SAE International) as the
-  authoritative source of truth.
+- The **SAE J1939** standard documents (published by SAE International) are the
+  authoritative source of truth for every wire format here.
+- [Open-SAE-J1939] — a thorough, MIT-licensed C implementation covering the
+  transport protocol, diagnostics, network management, and ISO 11783. Studied as
+  a structural reference and a source of known-good frames; not copied.
 
-**We deliberately do not study copyleft J1939 implementations.** Keeping this
-project embeddable in proprietary firmware means keeping its implementation
-history free of GPL-derived code — see
-[CONTRIBUTING.md](CONTRIBUTING.md#licensing-hygiene--please-read).
+Where the two disagree, the standard wins — see the note in
+`core/src/identification.rs` for one case where it did.
 
 ## Contributing
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
-workflow (DCO sign-off, local checks, the `no_std` core vs `host` split, and the
-licensing rule above). Good entry points are issues labelled
+workflow (DCO sign-off, local checks, the `no_std` core vs `host` split, and code
+provenance). Good entry points are issues labelled
 [`good first issue`](https://github.com/KarpagamKarthikeyan/sae-j1939-rs/labels/good%20first%20issue).
 Questions and ideas are welcome in
 [Discussions](https://github.com/KarpagamKarthikeyan/sae-j1939-rs/discussions).

@@ -66,6 +66,23 @@ pub const MIN_MESSAGE_SIZE: u16 = 9;
 /// bytes.
 pub const MAX_MESSAGE_SIZE: u16 = 1785;
 
+/// `T1` (J1939-21): the longest gap allowed between TP.DT packets of a transfer
+/// in progress, in milliseconds. A receiver that sees no packet for this long
+/// should abandon the session — see [`Reassembler::tick`].
+pub const T1_TIMEOUT_MS: u16 = 750;
+
+/// `T2` (J1939-21): how long a receiver waits for the first TP.DT after sending
+/// a CTS, in milliseconds.
+pub const T2_TIMEOUT_MS: u16 = 1250;
+
+/// `T3` (J1939-21): how long a sender waits for a CTS or end-of-message
+/// acknowledgement, in milliseconds.
+pub const T3_TIMEOUT_MS: u16 = 1250;
+
+/// `T4` (J1939-21): how long a sender honours a "wait" CTS before giving up, in
+/// milliseconds.
+pub const T4_TIMEOUT_MS: u16 = 1050;
+
 /// The number of TP.DT packets needed to carry `size` bytes.
 ///
 /// ```
@@ -409,14 +426,39 @@ pub enum Rx<'a> {
 /// `N` is the largest message this receiver will accept, in bytes. A transfer
 /// announcing more than `N` is refused — with an abort for RTS/CTS, silently
 /// for a BAM, which has no back-channel — so the buffer can never overflow.
-/// Use `Reassembler::<1785>` to accept anything the protocol allows.
 ///
-/// One session is tracked at a time, which matches J1939-21: an ECU may not run
-/// two connection-managed sessions with the same peer for the same PGN.
+/// `SESSIONS` is how many peers may have a transfer in flight at once, and
+/// defaults to one. Each costs `N` bytes of buffer, so an MCU can keep it at one
+/// while a host tracking a whole bus raises it:
+///
+/// ```
+/// # use sae_j1939_rs::tp::Reassembler;
+/// let mut node = Reassembler::<256>::new();          // one peer, 256 bytes
+/// let mut tool = Reassembler::<1785, 8>::new();      // eight peers, ~14 KiB
+/// # let _ = (node.is_busy(), tool.is_busy());
+/// ```
+///
+/// Sessions are keyed by source address. A peer may only have one transfer open
+/// at a time, which is what J1939-21 requires; a second concurrent request from
+/// the same peer is aborted, and a request from a new peer when every slot is
+/// full is refused for lack of resources.
 #[derive(Debug)]
-pub struct Reassembler<const N: usize> {
+pub struct Reassembler<const N: usize, const SESSIONS: usize = 1> {
+    slots: [Slot<N>; SESSIONS],
+}
+
+/// One in-flight transfer and the buffer it is filling.
+#[derive(Debug, Clone, Copy)]
+struct Slot<const N: usize> {
     buffer: [u8; N],
     session: Option<Session>,
+}
+
+impl<const N: usize> Slot<N> {
+    const EMPTY: Self = Slot {
+        buffer: [0; N],
+        session: None,
+    };
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -435,34 +477,64 @@ struct Session {
     max_packets_per_cts: u8,
     /// BAM sessions are broadcast: no CTS, no acknowledgement, no abort.
     broadcast: bool,
+    /// Milliseconds since this session last made progress, accumulated by
+    /// [`Reassembler::tick`].
+    idle_ms: u16,
 }
 
-impl<const N: usize> Default for Reassembler<N> {
+impl<const N: usize, const SESSIONS: usize> Default for Reassembler<N, SESSIONS> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const N: usize> Reassembler<N> {
+impl<const N: usize, const SESSIONS: usize> Reassembler<N, SESSIONS> {
     /// Create an idle reassembler.
     pub const fn new() -> Self {
         Reassembler {
-            buffer: [0; N],
-            session: None,
+            slots: [Slot::EMPTY; SESSIONS],
         }
     }
 
-    /// Whether a transfer is currently in progress.
-    pub const fn is_busy(&self) -> bool {
-        self.session.is_some()
+    /// Whether any transfer is currently in progress.
+    pub fn is_busy(&self) -> bool {
+        self.slots.iter().any(|slot| slot.session.is_some())
     }
 
-    /// Abandon any session in progress.
+    /// How many transfers are in flight.
+    pub fn active_sessions(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.session.is_some())
+            .count()
+    }
+
+    /// Whether `source` has a transfer in progress.
+    pub fn is_receiving_from(&self, source: Address) -> bool {
+        self.slot_of(source).is_some()
+    }
+
+    /// Abandon every session in progress.
     ///
-    /// Call this when a session times out — J1939-21 allows 750 ms between
-    /// packets (`T1`). Timing lives with the caller, which owns the clock.
+    /// Call this when sessions time out — J1939-21 allows 750 ms between packets
+    /// (`T1`). Timing lives with the caller, which owns the clock. To drop a
+    /// single stalled peer, use [`Reassembler::abandon`].
     pub fn reset(&mut self) {
-        self.session = None;
+        for slot in self.slots.iter_mut() {
+            slot.session = None;
+        }
+    }
+
+    /// Abandon the session with `source`, if any, and report whether there was
+    /// one.
+    pub fn abandon(&mut self, source: Address) -> bool {
+        match self.slot_of(source) {
+            Some(index) => {
+                self.slots[index].session = None;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Handle an incoming TP.CM addressed to this ECU.
@@ -475,11 +547,15 @@ impl<const N: usize> Reassembler<N> {
                 // A BAM has no back-channel: an unacceptable announcement can
                 // only be dropped.
                 if !valid_announcement(size, packets) || size as usize > N {
-                    self.session = None;
+                    self.abandon(source);
                     return Rx::Idle;
                 }
+                let Some(index) = self.slot_for(source) else {
+                    // Every slot is busy and none belongs to this sender.
+                    return Rx::Idle;
+                };
                 // A BAM is pushed without permission, so there is no window limit.
-                self.begin(source, pgn, size, packets, true, packets, 0);
+                self.begin(index, source, pgn, size, packets, true, packets, 0);
                 Rx::Idle
             }
             TpCm::Rts {
@@ -500,16 +576,26 @@ impl<const N: usize> Reassembler<N> {
                         pgn,
                     });
                 }
-                // Only one connection-managed session at a time.
-                if self.session.is_some_and(|s| !s.broadcast) {
+                // One connection-managed session per peer, per J1939-21.
+                if let Some(index) = self.slot_of(source) {
+                    if self.slots[index].session.is_some_and(|s| !s.broadcast) {
+                        return Rx::Send(TpCm::Abort {
+                            reason: AbortReason::AlreadyInSession,
+                            pgn,
+                        });
+                    }
+                }
+                let Some(index) = self.slot_for(source) else {
+                    // No buffer free for a new peer.
                     return Rx::Send(TpCm::Abort {
-                        reason: AbortReason::AlreadyInSession,
+                        reason: AbortReason::ResourcesUnavailable,
                         pgn,
                     });
-                }
+                };
                 // Grant as much of the transfer as the sender will allow at once.
                 let window = grant_window(packets, max_packets_per_cts);
                 self.begin(
+                    index,
                     source,
                     pgn,
                     size,
@@ -525,9 +611,7 @@ impl<const N: usize> Reassembler<N> {
                 })
             }
             TpCm::Abort { .. } => {
-                if self.session.is_some_and(|s| s.source == source) {
-                    self.session = None;
-                }
+                self.abandon(source);
                 Rx::Idle
             }
             // Sender-side messages; not ours to act on.
@@ -537,26 +621,26 @@ impl<const N: usize> Reassembler<N> {
 
     /// Handle an incoming TP.DT packet addressed to this ECU.
     pub fn on_tp_dt(&mut self, source: Address, dt: &TpDt) -> Rx<'_> {
-        let Some(mut session) = self.session else {
-            // No announcement preceded this packet.
+        // No announcement preceded this packet, or it belongs to a peer we are
+        // not tracking.
+        let Some(index) = self.slot_of(source) else {
             return Rx::Idle;
         };
-        if session.source != source {
-            // A packet from an unrelated ECU; leave our session untouched.
-            return Rx::Idle;
-        }
+        let mut session = match self.slots[index].session {
+            Some(session) => session,
+            None => return Rx::Idle,
+        };
+
         if dt.sequence != session.next_sequence {
             // Out of order. A BAM cannot be recovered, so drop it; an RTS/CTS
             // session is aborted so the sender learns immediately.
-            let pgn = session.pgn;
-            let broadcast = session.broadcast;
-            self.session = None;
-            return if broadcast {
+            self.slots[index].session = None;
+            return if session.broadcast {
                 Rx::Idle
             } else {
                 Rx::Send(TpCm::Abort {
                     reason: AbortReason::BadSequenceNumber,
-                    pgn,
+                    pgn: session.pgn,
                 })
             };
         }
@@ -564,14 +648,14 @@ impl<const N: usize> Reassembler<N> {
         // Copy this packet's slice of the message, clamped to the announced size.
         let offset = (dt.sequence as usize - 1) * BYTES_PER_PACKET;
         let end = (offset + BYTES_PER_PACKET).min(session.size as usize);
-        self.buffer[offset..end].copy_from_slice(&dt.data[..end - offset]);
+        self.slots[index].buffer[offset..end].copy_from_slice(&dt.data[..end - offset]);
 
         // Check for completion *before* advancing: a 255-packet transfer is the
         // protocol maximum, and `next_sequence` would overflow past it.
         if dt.sequence == session.packets {
-            // Clear the session before handing out the payload so the
-            // reassembler is immediately ready for the next transfer.
-            self.session = None;
+            // Clear the session before handing out the payload so the slot is
+            // immediately ready for the next transfer.
+            self.slots[index].session = None;
             let ack = (!session.broadcast).then_some(TpCm::EndOfMsgAck {
                 size: session.size,
                 packets: session.packets,
@@ -580,21 +664,23 @@ impl<const N: usize> Reassembler<N> {
             return Rx::Message {
                 pgn: session.pgn,
                 source: session.source,
-                data: &self.buffer[..session.size as usize],
+                data: &self.slots[index].buffer[..session.size as usize],
                 ack,
             };
         }
 
         session.next_sequence += 1;
         session.window_remaining = session.window_remaining.saturating_sub(1);
-        self.session = Some(session);
+        session.idle_ms = 0;
+        self.slots[index].session = Some(session);
+
         if !session.broadcast && session.window_remaining == 0 {
             // The granted window is used up; open the next one, still within
             // the limit the sender stated in its RTS.
             let remaining = session.packets - session.next_sequence + 1;
             let window = grant_window(remaining, session.max_packets_per_cts);
-            if let Some(s) = self.session.as_mut() {
-                s.window_remaining = window;
+            if let Some(active) = self.slots[index].session.as_mut() {
+                active.window_remaining = window;
             }
             return Rx::Send(TpCm::Cts {
                 packets: window,
@@ -605,9 +691,80 @@ impl<const N: usize> Reassembler<N> {
         Rx::Idle
     }
 
+    /// Advance every session's idle timer by `elapsed_ms`, abandoning any that
+    /// has gone quiet for longer than [`T1_TIMEOUT_MS`].
+    ///
+    /// This type owns no clock — call this from whatever timer you already
+    /// have, passing the milliseconds since the last call. `on_timeout` is
+    /// invoked once per abandoned session with the peer's address and, for a
+    /// destination-specific transfer, the [`TpCm::Abort`] to send back. A
+    /// broadcast has no back-channel, so it yields `None`.
+    ///
+    /// ```
+    /// use sae_j1939_rs::tp::{Reassembler, TpCm, T1_TIMEOUT_MS};
+    /// use sae_j1939_rs::{pgn, Address};
+    ///
+    /// let peer = Address::new(0x80);
+    /// let mut rx = Reassembler::<256>::new();
+    /// rx.on_tp_cm(peer, &TpCm::rts(21, pgn::DM1).unwrap());
+    ///
+    /// // The sender goes quiet. After T1 the session is dropped.
+    /// let mut dropped = None;
+    /// rx.tick(T1_TIMEOUT_MS + 1, |address, abort| dropped = Some((address, abort)));
+    ///
+    /// let (address, abort) = dropped.expect("the stalled session should time out");
+    /// assert_eq!(address, peer);
+    /// assert!(matches!(abort, Some(TpCm::Abort { .. })));
+    /// assert!(!rx.is_busy());
+    /// ```
+    pub fn tick(&mut self, elapsed_ms: u16, on_timeout: impl FnMut(Address, Option<TpCm>)) {
+        self.tick_with_timeout(elapsed_ms, T1_TIMEOUT_MS, on_timeout)
+    }
+
+    /// [`Reassembler::tick`] with a timeout of your choosing, for buses that
+    /// deviate from `T1`.
+    pub fn tick_with_timeout(
+        &mut self,
+        elapsed_ms: u16,
+        timeout_ms: u16,
+        mut on_timeout: impl FnMut(Address, Option<TpCm>),
+    ) {
+        for slot in self.slots.iter_mut() {
+            let Some(session) = slot.session.as_mut() else {
+                continue;
+            };
+            session.idle_ms = session.idle_ms.saturating_add(elapsed_ms);
+            if session.idle_ms <= timeout_ms {
+                continue;
+            }
+            let abort = (!session.broadcast).then_some(TpCm::Abort {
+                reason: AbortReason::Timeout,
+                pgn: session.pgn,
+            });
+            let source = session.source;
+            slot.session = None;
+            on_timeout(source, abort);
+        }
+    }
+
+    /// The slot holding `source`'s session, if it has one.
+    fn slot_of(&self, source: Address) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|slot| slot.session.is_some_and(|s| s.source == source))
+    }
+
+    /// The slot to start a transfer from `source` in: its existing one, or the
+    /// first free slot.
+    fn slot_for(&self, source: Address) -> Option<usize> {
+        self.slot_of(source)
+            .or_else(|| self.slots.iter().position(|slot| slot.session.is_none()))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn begin(
         &mut self,
+        index: usize,
         source: Address,
         pgn: Pgn,
         size: u16,
@@ -616,7 +773,7 @@ impl<const N: usize> Reassembler<N> {
         window: u8,
         max_packets_per_cts: u8,
     ) {
-        self.session = Some(Session {
+        self.slots[index].session = Some(Session {
             source,
             pgn,
             size,
@@ -625,6 +782,7 @@ impl<const N: usize> Reassembler<N> {
             window_remaining: window,
             max_packets_per_cts,
             broadcast,
+            idle_ms: 0,
         });
     }
 }
@@ -1122,19 +1280,173 @@ mod tests {
         assert!(!rx.is_busy());
     }
 
+    /// J1939-21 allows a peer only one connection-managed session at a time.
     #[test]
-    fn refuses_a_second_concurrent_session() {
-        let mut rx = Reassembler::<256>::new();
+    fn refuses_a_second_session_from_the_same_peer() {
+        let mut rx = Reassembler::<256, 4>::new();
         rx.on_tp_cm(SENDER, &TpCm::rts(21, pgn::DM1).unwrap());
 
-        let other = Address::new(0x91);
         assert_eq!(
-            rx.on_tp_cm(other, &TpCm::rts(21, pgn::DM2).unwrap()),
+            rx.on_tp_cm(SENDER, &TpCm::rts(21, pgn::DM2).unwrap()),
             Rx::Send(TpCm::Abort {
                 reason: AbortReason::AlreadyInSession,
                 pgn: pgn::DM2,
             })
         );
+    }
+
+    /// A new peer arriving with no slot free is short of resources, which is a
+    /// different failure from the same peer opening a second session.
+    #[test]
+    fn refuses_a_new_peer_when_every_slot_is_occupied() {
+        let mut rx = Reassembler::<256>::new(); // one slot
+        rx.on_tp_cm(SENDER, &TpCm::rts(21, pgn::DM1).unwrap());
+
+        assert_eq!(
+            rx.on_tp_cm(Address::new(0x91), &TpCm::rts(21, pgn::DM2).unwrap()),
+            Rx::Send(TpCm::Abort {
+                reason: AbortReason::ResourcesUnavailable,
+                pgn: pgn::DM2,
+            })
+        );
+        assert_eq!(rx.active_sessions(), 1);
+    }
+
+    /// Two ECUs broadcasting at the same time is routine on a busy bus. Their
+    /// packets interleave, and both messages must survive intact.
+    #[test]
+    fn concurrent_transfers_from_different_peers_do_not_corrupt_each_other() {
+        let alice = Address::new(0x80);
+        let bob = Address::new(0x91);
+        let alice_payload: [u8; 14] = [0xA0; 14];
+        let bob_payload: [u8; 14] = [0xB0; 14];
+
+        let mut rx = Reassembler::<256, 4>::new();
+        rx.on_tp_cm(alice, &TpCm::bam(14, pgn::DM1).unwrap());
+        rx.on_tp_cm(bob, &TpCm::bam(14, pgn::DM2).unwrap());
+        assert_eq!(rx.active_sessions(), 2);
+        assert!(rx.is_receiving_from(alice));
+        assert!(rx.is_receiving_from(bob));
+
+        let alice_packets: std::vec::Vec<TpDt> = packets_for(&alice_payload).collect();
+        let bob_packets: std::vec::Vec<TpDt> = packets_for(&bob_payload).collect();
+
+        // Fully interleaved: A1, B1, A2, B2.
+        assert_eq!(rx.on_tp_dt(alice, &alice_packets[0]), Rx::Idle);
+        assert_eq!(rx.on_tp_dt(bob, &bob_packets[0]), Rx::Idle);
+
+        match rx.on_tp_dt(alice, &alice_packets[1]) {
+            Rx::Message {
+                pgn, source, data, ..
+            } => {
+                assert_eq!(pgn, pgn::DM1);
+                assert_eq!(source, alice);
+                assert_eq!(data, &alice_payload);
+            }
+            other => panic!("expected Alice's message, got {other:?}"),
+        }
+        match rx.on_tp_dt(bob, &bob_packets[1]) {
+            Rx::Message {
+                pgn, source, data, ..
+            } => {
+                assert_eq!(pgn, pgn::DM2);
+                assert_eq!(source, bob);
+                assert_eq!(data, &bob_payload);
+            }
+            other => panic!("expected Bob's message, got {other:?}"),
+        }
+        assert_eq!(rx.active_sessions(), 0);
+    }
+
+    #[test]
+    fn a_session_survives_until_the_timeout_then_expires() {
+        let mut rx = Reassembler::<256>::new();
+        rx.on_tp_cm(SENDER, &TpCm::bam(21, pgn::DM1).unwrap());
+
+        // Just under T1: still alive.
+        let mut expired = std::vec::Vec::new();
+        rx.tick(T1_TIMEOUT_MS - 1, |address, abort| {
+            expired.push((address, abort))
+        });
+        assert!(rx.is_busy());
+        assert!(expired.is_empty());
+
+        // A packet arrives, resetting the idle timer.
+        rx.on_tp_dt(SENDER, &TpDt::new(1, &[0; 7]));
+        rx.tick(T1_TIMEOUT_MS - 1, |address, abort| {
+            expired.push((address, abort))
+        });
+        assert!(rx.is_busy(), "a packet must restart the clock");
+        assert!(expired.is_empty());
+
+        // Then silence past T1.
+        rx.tick(2, |address, abort| expired.push((address, abort)));
+        assert!(!rx.is_busy());
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, SENDER);
+        // A broadcast has nobody to tell.
+        assert_eq!(expired[0].1, None);
+    }
+
+    #[test]
+    fn a_timed_out_addressed_session_yields_an_abort_to_send() {
+        let mut rx = Reassembler::<256>::new();
+        rx.on_tp_cm(SENDER, &TpCm::rts(21, pgn::DM1).unwrap());
+
+        let mut expired = std::vec::Vec::new();
+        rx.tick(T1_TIMEOUT_MS + 1, |address, abort| {
+            expired.push((address, abort))
+        });
+        assert_eq!(
+            expired,
+            [(
+                SENDER,
+                Some(TpCm::Abort {
+                    reason: AbortReason::Timeout,
+                    pgn: pgn::DM1,
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn a_timeout_expires_only_the_stalled_peer() {
+        let alice = Address::new(0x80);
+        let bob = Address::new(0x91);
+        let mut rx = Reassembler::<256, 4>::new();
+        rx.on_tp_cm(alice, &TpCm::bam(21, pgn::DM1).unwrap());
+
+        // Alice idles while Bob starts later and keeps sending.
+        rx.tick(T1_TIMEOUT_MS - 1, |_, _| {});
+        rx.on_tp_cm(bob, &TpCm::bam(21, pgn::DM2).unwrap());
+
+        let mut expired = std::vec::Vec::new();
+        rx.tick(2, |address, _| expired.push(address));
+        assert_eq!(expired, [alice], "only the stalled session expires");
+        assert!(rx.is_receiving_from(bob));
+        assert_eq!(rx.active_sessions(), 1);
+    }
+
+    #[test]
+    fn abandoning_one_peer_leaves_the_others_alone() {
+        let alice = Address::new(0x80);
+        let bob = Address::new(0x91);
+
+        let mut rx = Reassembler::<256, 4>::new();
+        rx.on_tp_cm(alice, &TpCm::bam(14, pgn::DM1).unwrap());
+        rx.on_tp_cm(bob, &TpCm::bam(14, pgn::DM2).unwrap());
+
+        assert!(rx.abandon(alice));
+        assert!(!rx.abandon(alice), "already gone");
+        assert!(!rx.is_receiving_from(alice));
+        assert!(
+            rx.is_receiving_from(bob),
+            "Bob's transfer must be untouched"
+        );
+        assert_eq!(rx.active_sessions(), 1);
+
+        rx.reset();
+        assert_eq!(rx.active_sessions(), 0);
     }
 
     #[test]

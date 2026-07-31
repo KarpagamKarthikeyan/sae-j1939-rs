@@ -9,6 +9,9 @@ use crate::types::{Error, Result};
 /// The maximum payload of a single classic CAN frame.
 pub const MAX_PAYLOAD: usize = 8;
 
+/// The value J1939 specifies for unused payload bytes.
+const FILL: u8 = 0xFF;
+
 /// One J1939 frame — a decoded identifier plus its payload.
 ///
 /// This is the unit the protocol layers consume and produce. Messages longer
@@ -43,7 +46,9 @@ impl Frame {
                 actual: data.len(),
             });
         }
-        let mut buf = [0u8; MAX_PAYLOAD];
+        // J1939 fills unused payload bytes with 0xFF, not zero, so `payload()`
+        // reads back the way the parameter group codecs expect.
+        let mut buf = [FILL; MAX_PAYLOAD];
         buf[..data.len()].copy_from_slice(data);
         Ok(Frame {
             id,
@@ -72,10 +77,11 @@ impl Frame {
         &self.data[..self.len as usize]
     }
 
-    /// The full eight-byte payload, zero-padded.
+    /// The full eight-byte payload, padded with `0xFF`.
     ///
     /// Convenient for the fixed-width parameter-group codecs, which are defined
-    /// over all eight bytes.
+    /// over all eight bytes. J1939 specifies `0xFF` for unused bytes, so a short
+    /// frame reads back exactly as a conforming sender would have transmitted it.
     pub const fn payload(&self) -> &[u8; MAX_PAYLOAD] {
         &self.data
     }
@@ -99,8 +105,13 @@ mod tests {
         assert_eq!(frame.source_address(), Address::new(0x80));
         assert_eq!(frame.data(), &[0x01, 0x02, 0x03]);
         assert_eq!(frame.dlc(), 3);
-        // Short frames are zero-padded for the fixed-width codecs.
-        assert_eq!(frame.payload(), &[0x01, 0x02, 0x03, 0, 0, 0, 0, 0]);
+        // Unused bytes read back as J1939's 0xFF filler, not zero.
+        assert_eq!(
+            frame.payload(),
+            &[0x01, 0x02, 0x03, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        // ...but `data()` is still trimmed to what was actually supplied.
+        assert_eq!(frame.data(), &[0x01, 0x02, 0x03]);
     }
 
     #[test]

@@ -11,8 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A broader PGN/SPN parameter database (J1939-71).
 - ISO 11783 tractor/implement extensions (stretch goal).
-- Session timeout helpers (J1939-21 `T1`–`T4`) for callers that want them
-  prebuilt rather than driven from their own clock.
 
 ## [0.1.0] - unreleased
 
@@ -35,15 +33,24 @@ parameter groups, and a SocketCAN transport.
   - `tp` — the transport protocol, both directions:
     - `TpCm` (RTS / CTS / EndOfMsgAck / BAM / Abort) and `TpDt` codecs, with the
       standard `AbortReason` set.
-    - `Reassembler<N>` — receives BAM and RTS/CTS transfers up to 1785 bytes,
-      generic over the largest message it will accept so an MCU bounds its own
-      memory. Oversized transfers are refused with an abort, out-of-order
-      packets abort the session, and a second concurrent session is rejected.
+    - `Reassembler<N, SESSIONS>` — receives BAM and RTS/CTS transfers up to 1785
+      bytes, generic over both the largest message it will accept and how many
+      peers may be mid-transfer, so an MCU bounds its own memory. Interleaved
+      transfers from different ECUs are reassembled independently. Oversized
+      transfers are refused with an abort, out-of-order packets abort the
+      session, and a peer opening a second session is rejected.
+    - `Reassembler::tick` — expires sessions that go quiet longer than `T1`
+      (750 ms), yielding the abort to send back. The caller supplies elapsed
+      time, so no clock is forced on `no_std` users. `T1`–`T4` are exposed as
+      constants.
     - `Transmitter` — drives a BAM or an RTS/CTS handshake, borrowing the
       payload so a large message costs no extra RAM.
 
   - `request` — the Request (`0x00EA00`) and Acknowledgement (`0x00E800`)
     parameter groups, with the four standard control bytes.
+  - `proprietary` — Proprietary A (addressed) and Proprietary B (broadcast, 256
+    group extensions across two data pages), with the addressing rules enforced
+    by the type.
 
   *J1939-81 — network management*
   - `Name` — the 64-bit ECU NAME, all nine fields, each masked to its bit width.
@@ -54,7 +61,8 @@ parameter groups, and a SocketCAN transport.
   *J1939-73 — diagnostics*
   - `diagnostics` — DM1/DM2: `Lamps` (four lamps, status and flash status),
     `Dtc` (19-bit SPN, 5-bit FMI, occurrence count, conversion method), a
-    borrowing `Message` parser, and `encode`.
+    borrowing `Message` parser, and `encode`. `dm3` covers the clear-codes
+    request/acknowledge exchange.
   - `memory_access` — DM14 (request), DM15 (response), and DM16 (binary data
     transfer), including the 11-bit byte count split across two bytes and the
     24-bit pointer and EDC parameter fields.
@@ -74,8 +82,10 @@ parameter groups, and a SocketCAN transport.
   - `SocketCan` — Linux SocketCAN transport: `send`, `send_frame`, `recv`
     (skipping non-J1939 traffic), and `request` for the J1939 Request PGN.
   - `SocketCan::recv_message` — returns whole J1939 messages, transparently
-    reassembling multi-packet transfers and sending the CTS and end-of-message
-    acknowledgements an RTS/CTS transfer needs.
+    reassembling multi-packet transfers from up to eight peers at once and
+    sending the CTS and end-of-message acknowledgements an RTS/CTS transfer
+    needs. `transfers_in_flight` and `abandon_transfer` expose the reassembly
+    state.
   - `vcan_dump` example — decode live traffic, reassemble multi-packet
     messages, and pretty-print NAME and DM1/DM2 payloads.
 

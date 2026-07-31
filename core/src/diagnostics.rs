@@ -38,7 +38,9 @@
 //! assert_eq!(dtc.occurrence_count, 3);
 //! ```
 
-use crate::types::{Error, Result};
+use crate::pgn;
+use crate::request::{AckControl, Acknowledgement, Request};
+use crate::types::{Address, Error, Result};
 
 /// Bytes each Diagnostic Trouble Code occupies.
 pub const DTC_LEN: usize = 4;
@@ -373,9 +375,84 @@ pub fn encode(lamps: Lamps, dtcs: &[Dtc], out: &mut [u8]) -> Result<usize> {
     Ok(len)
 }
 
+/// DM3 — clear previously active diagnostic trouble codes (PGN `0x00FECC`).
+///
+/// DM3 carries no payload of its own: it is issued as a [`Request`] for the DM3
+/// parameter group, and the target answers with an [`Acknowledgement`]. These
+/// helpers spell that exchange out so it does not have to be rediscovered.
+///
+/// ```
+/// use sae_j1939_rs::diagnostics::dm3;
+/// use sae_j1939_rs::request::AckControl;
+/// use sae_j1939_rs::{pgn, Address};
+///
+/// // A tool asks an ECU to clear its stored faults.
+/// let request = dm3::clear_request();
+/// assert_eq!(request.pgn, pgn::DM3);
+///
+/// // The ECU confirms it did.
+/// let ack = dm3::acknowledge(Address::new(0x80));
+/// assert_eq!(ack.control, AckControl::Acknowledged);
+/// assert_eq!(ack.pgn, pgn::DM3);
+/// ```
+pub mod dm3 {
+    use super::*;
+
+    /// The Request that tells an ECU to clear its previously active trouble
+    /// codes.
+    ///
+    /// Send it as PGN [`pgn::REQUEST`], addressed to the ECU you want cleared —
+    /// or to [`Address::GLOBAL`] to clear the whole bus, which you should be
+    /// deliberate about.
+    pub const fn clear_request() -> Request {
+        Request::new(pgn::DM3)
+    }
+
+    /// Whether an incoming [`Request`] is asking this ECU to clear its codes.
+    pub fn is_clear_request(request: &Request) -> bool {
+        request.pgn == pgn::DM3
+    }
+
+    /// The positive acknowledgement to send once the codes are cleared.
+    pub const fn acknowledge(responder: Address) -> Acknowledgement {
+        Acknowledgement::positive(pgn::DM3, responder)
+    }
+
+    /// The refusal to send when the codes cannot be cleared — typically because
+    /// the vehicle is not in a safe state to do it.
+    pub const fn refuse(responder: Address, reason: AckControl) -> Acknowledgement {
+        Acknowledgement {
+            control: reason,
+            group_function: 0xFF,
+            address: responder,
+            pgn: pgn::DM3,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dm3_round_trips_as_a_request_and_acknowledgement() {
+        let request = dm3::clear_request();
+        assert_eq!(request.encode(), [0xCC, 0xFE, 0x00]);
+        assert!(dm3::is_clear_request(
+            &Request::decode(&request.encode()).unwrap()
+        ));
+        // A request for a different group must not be mistaken for DM3.
+        assert!(!dm3::is_clear_request(&Request::new(pgn::DM1)));
+
+        let ack = dm3::acknowledge(Address::new(0x80));
+        assert!(ack.control.is_positive());
+        assert_eq!(Acknowledgement::decode(&ack.encode()), ack);
+
+        let refusal = dm3::refuse(Address::new(0x80), AckControl::Busy);
+        assert_eq!(refusal.control, AckControl::Busy);
+        assert!(!refusal.control.is_positive());
+        assert_eq!(refusal.pgn, pgn::DM3);
+    }
 
     #[test]
     fn lamp_fields_are_independent() {
