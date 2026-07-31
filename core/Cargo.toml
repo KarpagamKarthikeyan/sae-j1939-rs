@@ -1,0 +1,26 @@
+[package]
+name = "sae-j1939-rs"
+description = "A no_std-first SAE J1939 protocol stack in Rust: 29-bit identifier and PGN codecs, transport protocol (BAM/RTS-CTS), network management, and diagnostics."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+documentation = "https://docs.rs/sae-j1939-rs"
+readme = "../README.md"
+
+[dependencies]
+embedded-can.workspace = true
+
+# Only the tests need bounded collections; the library itself is plain arrays.
+[dev-dependencies]
+heapless.workspace = true
+
+[features]
+default = []
+# `std` enables host-side conveniences (e.g. `std::error::Error` impls).
+# It must never be required by the core protocol logic.
+std = []

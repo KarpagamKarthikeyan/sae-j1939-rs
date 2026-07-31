@@ -1,0 +1,6 @@
+/target
+# Reference implementations are studied locally, never vendored into this repo.
+# See README "References studied (not copied)".
+/reference
+*.rs.bk
+.DS_Store

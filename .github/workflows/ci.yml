@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Note: warnings are denied per-step (clippy `-D warnings`, rustdoc
+# RUSTDOCFLAGS) rather than via a global RUSTFLAGS, so a warning in a
+# third-party dependency cannot fail the build.
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (stable, linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The host crate compiles the SocketCAN transport natively here.
+      - run: cargo test --workspace --all-features
+
+  lint:
+    name: fmt + clippy + docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  no_std:
+    name: no_std build (thumbv7em)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      # Building the core for a bare-metal target proves it stays no_std.
+      - run: cargo build -p sae-j1939-rs --target thumbv7em-none-eabihf
+
+  msrv:
+    name: MSRV 1.75 (core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.75.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p sae-j1939-rs --all-features
+
+  vcan:
+    name: on-bus frame decode (vcan0)
+    runs-on: ubuntu-latest
+    # The vcan kernel module is not guaranteed on hosted runners; this job runs
+    # the on-bus test opportunistically and does not block CI. The authoritative
+    # on-bus validation is `tools/vcan_setup.sh` + this example on your own box.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Bring up a virtual CAN interface, then run the SocketCAN transport
+      # end-to-end over it.
+      - name: Set up vcan0
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" can-utils
+          sudo modprobe vcan
+          sudo ip link add dev vcan0 type vcan
+          sudo ip link set up vcan0
+          ip -details -brief link show vcan0
+      - name: Decode injected J1939 traffic
+        run: |
+          # Inject a DM1 broadcast and an addressed Request once the dumper is up.
+          (sleep 2 && cansend vcan0 18FECA80#0100000000000000 \
+                   && cansend vcan0 18EA9080#00EE0000000000) &
+          cargo run -p sae-j1939-host --example vcan_dump

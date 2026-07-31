@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["core", "host"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Karpagam Karthikeyan"]
+repository = "https://github.com/KarpagamKarthikeyan/sae-j1939-rs"
+rust-version = "1.75"
+keywords = ["j1939", "can", "canbus", "embedded", "no_std"]
+categories = ["embedded", "no-std", "network-programming"]
+
+[workspace.dependencies]
+# The no_std core, depended on by host crates.
+sae-j1939-rs = { path = "core", version = "0.1.0" }
+
+# Transport-agnostic CAN frame/id abstraction (no_std). J1939 uses only the
+# 29-bit extended identifier, but the trait surface is shared with canopen-rs.
+embedded-can = "0.4"
+
+# Bounded collections, used only by the core crate's tests.
+heapless = "0.8"
+
+# Linux SocketCAN transport (host only, Linux only).
+socketcan = "3.3"
