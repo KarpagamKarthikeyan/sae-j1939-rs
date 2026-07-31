@@ -57,6 +57,19 @@ impl Frame {
         })
     }
 
+    /// Build a frame from an identifier and a full eight-byte payload.
+    ///
+    /// Infallible, unlike [`Frame::new`]: a payload of exactly [`MAX_PAYLOAD`]
+    /// bytes always fits. Most J1939 parameter groups encode to exactly eight
+    /// bytes, so this is the common case.
+    pub const fn from_payload(id: Id, data: [u8; MAX_PAYLOAD]) -> Self {
+        Frame {
+            id,
+            data,
+            len: MAX_PAYLOAD as u8,
+        }
+    }
+
     /// The frame's identifier.
     pub const fn id(&self) -> Id {
         self.id
@@ -112,6 +125,16 @@ mod tests {
         );
         // ...but `data()` is still trimmed to what was actually supplied.
         assert_eq!(frame.data(), &[0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn a_full_payload_needs_no_fallible_constructor() {
+        let id = Id::new(0x18FECA80).unwrap();
+        let bytes = [1, 2, 3, 4, 5, 6, 7, 8];
+        let frame = Frame::from_payload(id, bytes);
+        assert_eq!(frame.dlc(), 8);
+        assert_eq!(frame.data(), &bytes);
+        assert_eq!(Frame::new(id, &bytes).unwrap(), frame);
     }
 
     #[test]

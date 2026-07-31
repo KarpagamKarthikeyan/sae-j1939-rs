@@ -52,6 +52,7 @@ on a microcontroller with no allocator, as well as on a laptop.
 | **Address claiming**: contention, defence, relocation, commanded address | -81 | ✅ |
 | **DM1 / DM2**: lamp status + trouble codes (SPN/FMI/occurrence) | -73 | ✅ |
 | **DM3**: clear previously active trouble codes | -73 | ✅ |
+| **`Node`**: one type doing claiming, filtering, reassembly, and dispatch | — | ✅ |
 | `embedded-can` bridge + SocketCAN transport with message reassembly | — | ✅ |
 | **Request and Acknowledgement** parameter groups | -21 | ✅ |
 | **DM14/DM15/DM16**: memory read, write, and binary data transfer | -73 | ✅ |
@@ -78,6 +79,45 @@ implementation — no host crate needed. In `sae-j1939-host`, the SocketCAN
 transport is compiled only on Linux. **MSRV: Rust 1.75.**
 
 ## Quickstart
+
+### Run a whole ECU
+
+`Node` wires the protocol layers together: it filters frames by destination,
+claims and defends an address, routes transport-protocol traffic to a
+reassembler, and answers the CTS and end-of-message handshakes itself. Feed it
+frames; it tells you what to send and what arrived.
+
+```rust
+use sae_j1939_rs::node::{Event, Node};
+use sae_j1939_rs::{Address, Name};
+
+let name = Name::new()
+    .with_manufacturer_code(300)
+    .with_identity_number(4242)
+    .with_arbitrary_address_capable(true);
+
+// Accept messages up to 1785 bytes from up to four peers at once.
+let mut node = Node::<1785, 4>::new(name, Address::new(0x80));
+
+bus.send(node.start())?;                  // announce ourselves
+
+loop {
+    match node.on_frame(&bus.recv()?) {
+        Event::Idle => {}
+        Event::Transmit(frame) => bus.send(frame)?,
+        Event::Message { pgn, source, data, reply } => {
+            // `data` is a whole message — multi-packet transfers are already
+            // reassembled, and `reply` is the acknowledgement to send back.
+            println!("{pgn:?} from {source:?}: {} bytes", data.len());
+        }
+    }
+    node.tick(elapsed_ms, |frame| bus.send(frame).unwrap());
+}
+```
+
+It stays sans-I/O: `Node` owns no bus and no clock. You hand it frames and
+elapsed milliseconds, so the same code is testable on a host and runs on an MCU.
+Everything below is the layer underneath, for when you want only part of it.
 
 ### Decode a frame off the bus
 
@@ -233,11 +273,18 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   ```bash
   sudo tools/vcan_setup.sh                            # bring up vcan0
+
+  # A traffic decoder:
   cargo run -p sae-j1939-host --example vcan_dump
   # in another terminal — a 3-code DM1 spread over a BAM:
   cansend vcan0 1CECFF80#200E0002FFCAFE00
   cansend vcan0 1CEBFF80#0104002B01048364
   cansend vcan0 1CEBFF80#0200018721061FFE
+
+  # ...or a complete virtual ECU that claims an address and answers requests:
+  cargo run -p sae-j1939-host --example vcan_ecu
+  cansend vcan0 18EAFFF9#00EE00        # who is on the bus?
+  cansend vcan0 18EA80F9#CAFE00        # what faults do you have?
   ```
 
 ## Design
@@ -259,6 +306,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 | `request` | -21 | The Request and Acknowledgement parameter groups |
 | `proprietary` | -21 | Manufacturer-specific Proprietary A and B groups |
 | `iso11783` | ISOBUS | Tractor/implement auxiliary and general purpose valves |
+| `node` | — | A whole ECU: claiming, reassembly, and dispatch in one type |
 | `diagnostics` | -73 | DM1/DM2 trouble codes and lamp status |
 | `memory_access` | -73 | DM14/DM15/DM16 memory read, write, and data transfer |
 | `identification` | -71 | Software, ECU, and component identification |

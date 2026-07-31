@@ -88,6 +88,7 @@
 //! | [`proprietary`] | J1939-21 | Manufacturer-specific Proprietary A and B groups |
 //! | [`iso11783`] | ISO 11783 | Tractor/implement auxiliary and general purpose valves |
 //! | [`request`] | J1939-21 | The Request and Acknowledgement parameter groups |
+//! | [`node`] | — | A whole ECU: claiming, reassembly, and dispatch in one type |
 //! | [`can`] | — | Bridge to the [`embedded_can`] traits |
 //!
 //! Note that [`can`] — not `transport` — holds the CAN frame bridge, because in
@@ -121,6 +122,7 @@ pub mod identification;
 pub mod iso11783;
 pub mod memory_access;
 pub mod name;
+pub mod node;
 pub mod pgn;
 pub mod proprietary;
 pub mod request;
@@ -131,6 +133,7 @@ pub use address_claim::{AddressClaimer, ClaimState};
 pub use frame::Frame;
 pub use id::Id;
 pub use name::Name;
+pub use node::Node;
 pub use pgn::Pgn;
 pub use request::{Acknowledgement, Request};
 pub use types::{Address, Error, Priority, Result};

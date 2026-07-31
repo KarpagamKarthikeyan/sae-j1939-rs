@@ -192,7 +192,7 @@ impl AddressClaimer {
                 return ClaimAction::Announce(self.current_claim());
             }
         }
-        self.give_up()
+        ClaimAction::Announce(self.give_up())
     }
 
     /// Handle a request for the Address Claimed PGN.
@@ -232,13 +232,17 @@ impl AddressClaimer {
 
     /// Give up the address: enter [`ClaimState::CannotClaim`] and produce the
     /// Cannot Claim Address message.
-    pub fn give_up(&mut self) -> ClaimAction {
+    ///
+    /// Always yields a claim to broadcast — an ECU that stops using an address
+    /// must say so — so this returns the [`Claim`] directly rather than a
+    /// [`ClaimAction`] that could never be [`ClaimAction::Idle`].
+    pub fn give_up(&mut self) -> Claim {
         self.state = ClaimState::CannotClaim;
         self.address = Address::NULL;
-        ClaimAction::Announce(Claim {
+        Claim {
             source: Address::NULL,
             name: self.name,
-        })
+        }
     }
 
     /// The claim this ECU would announce right now.

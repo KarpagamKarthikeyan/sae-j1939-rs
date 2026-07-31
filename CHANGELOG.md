@@ -79,6 +79,15 @@ parameter groups, the ISO 11783 valve groups, and a SocketCAN transport.
     estimated flow. `ValveNumber` maps a valve to its three PGN blocks and back,
     including the measured position block that overlaps the Proprietary B range.
 
+  *Putting it together*
+  - `node::Node<BUF, SESSIONS>` — a whole ECU in one type: address claiming and
+    defence, the receive filter, transport-protocol reassembly, and the
+    CTS/acknowledgement handshakes. `on_frame` returns what to transmit and what
+    arrived; `tick` closes the 250 ms contention window and expires stalled
+    transfers. Still sans-I/O — it owns no bus and no clock.
+  - `Frame::from_payload` — infallible constructor for the common case of a full
+    eight-byte parameter group.
+
   *Transport-agnostic plumbing*
   - `can` — bridge to the `embedded-can` traits (`frame_from`, `j1939_id`,
     `decode`, `encode`).
@@ -94,6 +103,8 @@ parameter groups, the ISO 11783 valve groups, and a SocketCAN transport.
     state.
   - `vcan_dump` example — decode live traffic, reassemble multi-packet
     messages, and pretty-print NAME and DM1/DM2 payloads.
+  - `vcan_ecu` example — a complete virtual ECU built on `Node`: claims an
+    address, answers requests, and reports three trouble codes over a BAM.
 
 - **Project setup** — dual MIT/Apache-2.0 licensing, DCO-based contribution
   policy, Contributor Covenant code of conduct, issue and PR templates
