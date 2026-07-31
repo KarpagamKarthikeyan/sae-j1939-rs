@@ -13,7 +13,8 @@ construction equipment, and marine engines.
 
 > **Status: early development (0.1).** The API will change. The J1939-21 data
 > link and transport layers, J1939-81 network management, J1939-73 diagnostics,
-> and the J1939-71 identification groups are implemented and tested — see below.
+> the J1939-71 identification groups, and the ISO 11783 valve groups are
+> implemented and tested — see below.
 
 ## Why
 
@@ -55,8 +56,8 @@ on a microcontroller with no allocator, as well as on a laptop.
 | **Request and Acknowledgement** parameter groups | -21 | ✅ |
 | **DM14/DM15/DM16**: memory read, write, and binary data transfer | -73 | ✅ |
 | **Software / ECU / component identification** (`*`-delimited fields) | -71 | ✅ |
+| **ISO 11783 valves**: auxiliary (×16) and general purpose, command/flow/position | ISOBUS | ✅ |
 | Broader PGN/SPN parameter database | -71 | planned |
-| ISO 11783 (tractor/implement) extensions | — | planned |
 
 Everything in the core is `#![no_std]`, `#![deny(unsafe_code)]`, allocation-free,
 and builds for `thumbv7em-none-eabihf`. Every codec is validated against
@@ -257,6 +258,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 | `address_claim` | -81 | Claiming, defending, and relocating an address |
 | `request` | -21 | The Request and Acknowledgement parameter groups |
 | `proprietary` | -21 | Manufacturer-specific Proprietary A and B groups |
+| `iso11783` | ISOBUS | Tractor/implement auxiliary and general purpose valves |
 | `diagnostics` | -73 | DM1/DM2 trouble codes and lamp status |
 | `memory_access` | -73 | DM14/DM15/DM16 memory read, write, and data transfer |
 | `identification` | -71 | Software, ECU, and component identification |

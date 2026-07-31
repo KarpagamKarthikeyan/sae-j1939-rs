@@ -10,13 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Planned
 
 - A broader PGN/SPN parameter database (J1939-71).
-- ISO 11783 tractor/implement extensions (stretch goal).
+- More of ISO 11783 beyond the valve groups (task controller, virtual terminal).
 
 ## [0.1.0] - unreleased
 
 Initial release: the workspace, the J1939-21 data link and transport layers,
 J1939-81 network management, J1939-73 diagnostics, the J1939-71 identification
-parameter groups, and a SocketCAN transport.
+parameter groups, the ISO 11783 valve groups, and a SocketCAN transport.
 
 ### Added
 
@@ -72,6 +72,12 @@ parameter groups, and a SocketCAN transport.
     over the `*`-delimited ASCII fields the standard specifies, named accessors
     per parameter group, and encoders. Software Identification's leading count
     byte is parsed and can be checked against the fields actually present.
+
+  *ISO 11783 (ISOBUS)*
+  - `iso11783` — the auxiliary valve groups (command, estimated flow, measured
+    position) for all sixteen valves, and the general purpose valve command and
+    estimated flow. `ValveNumber` maps a valve to its three PGN blocks and back,
+    including the measured position block that overlaps the Proprietary B range.
 
   *Transport-agnostic plumbing*
   - `can` — bridge to the `embedded-can` traits (`frame_from`, `j1939_id`,

@@ -86,6 +86,7 @@
 //! | [`memory_access`] | J1939-73 | DM14/DM15/DM16 memory read, write, and data transfer |
 //! | [`identification`] | J1939-71 | Software, ECU, and component identification |
 //! | [`proprietary`] | J1939-21 | Manufacturer-specific Proprietary A and B groups |
+//! | [`iso11783`] | ISO 11783 | Tractor/implement auxiliary and general purpose valves |
 //! | [`request`] | J1939-21 | The Request and Acknowledgement parameter groups |
 //! | [`can`] | — | Bridge to the [`embedded_can`] traits |
 //!
@@ -95,9 +96,9 @@
 //! ## Status
 //!
 //! Early development. The API will change. The identifier, PGN, transport
-//! protocol, NAME, address-claiming, and diagnostic layers are implemented and
-//! tested against known-good frames. Application-layer parameter groups and the
-//! ISO 11783 extensions are next — see the roadmap in the workspace
+//! protocol, NAME, address-claiming, diagnostic, identification, and ISO 11783
+//! valve layers are implemented and tested against known-good frames. A broader
+//! PGN/SPN parameter database is next — see the roadmap in the workspace
 //! `README.md`.
 //!
 //! [SAE J1939]: https://www.sae.org/standards/development/ground-vehicle-standards/j1939
@@ -117,6 +118,7 @@ pub mod diagnostics;
 pub mod frame;
 pub mod id;
 pub mod identification;
+pub mod iso11783;
 pub mod memory_access;
 pub mod name;
 pub mod pgn;

@@ -11,6 +11,9 @@
 use sae_j1939_rs::address_claim::{AddressClaimer, ClaimAction, ClaimState};
 use sae_j1939_rs::diagnostics::{self, Dtc, Lamp, LampStatus, Lamps};
 use sae_j1939_rs::identification::{self, EcuIdentification};
+use sae_j1939_rs::iso11783::{
+    AuxiliaryValveCommand, AuxiliaryValveMeasuredPosition, FailSafeMode, ValveNumber, ValveState,
+};
 use sae_j1939_rs::request::{AckControl, Acknowledgement, Request};
 use sae_j1939_rs::tp::{Reassembler, Rx, TpCm, TpDt, Transmitter, Tx};
 use sae_j1939_rs::{pgn, Address, Id, Name, Priority};
@@ -319,6 +322,61 @@ fn the_receive_filter_separates_addressed_from_broadcast_traffic() {
         rx.is_busy(),
         "another ECU's packet must not advance our session"
     );
+}
+
+/// An implement commands a tractor valve and reads the position back — the
+/// round trip an ISOBUS hitch control actually performs.
+#[test]
+fn an_implement_commands_a_tractor_valve_and_reads_the_position_back() {
+    let implement = Address::new(0x80);
+    let tractor = Address::new(0x00);
+    let valve = ValveNumber::new(5).unwrap();
+
+    // Implement -> tractor: extend valve 5 at 60% flow.
+    let command = AuxiliaryValveCommand {
+        standard_flow: 60,
+        valve_state: ValveState::Extend,
+        fail_safe_mode: FailSafeMode::Activated,
+    };
+    let command_id = ValveNumber::broadcast_id(valve.command_pgn(), implement);
+    let frame = BusFrame::new(command_id, &command.encode());
+
+    // Tractor side: work out which valve this is for, then decode it.
+    assert_eq!(
+        ValveNumber::from_command_pgn(frame.id.pgn()),
+        Some(valve),
+        "the tractor must recover the valve number from the PGN"
+    );
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(frame.payload());
+    let received = AuxiliaryValveCommand::decode(&bytes);
+    assert_eq!(received, command);
+    assert!(received.valve_state.is_moving());
+
+    // Tractor -> implement: report where the cylinder actually is.
+    let position = AuxiliaryValveMeasuredPosition {
+        position_percent: 6000,
+        position_micrometres: 42_000,
+        valve_state: ValveState::Extend,
+    };
+    let position_id = ValveNumber::broadcast_id(valve.measured_position_pgn(), tractor);
+    let reply = BusFrame::new(position_id, &position.encode());
+
+    // The measured position block lives inside the Proprietary B range, so a
+    // decoder must resolve ISOBUS allocations before falling back to proprietary.
+    assert!(reply.id.pgn().is_proprietary_b());
+    assert_eq!(
+        ValveNumber::from_measured_position_pgn(reply.id.pgn()),
+        Some(valve)
+    );
+
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(reply.payload());
+    assert_eq!(AuxiliaryValveMeasuredPosition::decode(&bytes), position);
+
+    // Both directions are priority-3 broadcasts.
+    assert_eq!(command_id.priority(), Priority::CONTROL);
+    assert!(position_id.is_broadcast());
 }
 
 /// An ECU that loses arbitration and cannot move must fall silent, and keep

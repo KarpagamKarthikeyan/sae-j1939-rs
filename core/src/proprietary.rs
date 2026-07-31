@@ -70,6 +70,12 @@ impl ProprietaryB {
     ///
     /// Returns `None` for any PGN outside the reserved ranges.
     ///
+    /// **On an ISOBUS network, check the ISO 11783 allocations first.** The
+    /// auxiliary valve measured position block (`0x00FF20`–`0x00FF2F`) sits
+    /// inside the Proprietary B range, so this method will happily classify a
+    /// valve position report as manufacturer-specific — see
+    /// [`ValveNumber::from_measured_position_pgn`](crate::iso11783::ValveNumber::from_measured_position_pgn).
+    ///
     /// ```
     /// use sae_j1939_rs::proprietary::ProprietaryB;
     /// use sae_j1939_rs::{pgn, Pgn};
@@ -138,6 +144,9 @@ pub const fn broadcast_id(priority: Priority, group: ProprietaryB, source: Addre
 }
 
 /// Whether a PGN is proprietary at all, of either kind.
+///
+/// Carries the same ISOBUS caveat as [`ProprietaryB::from_pgn`]: part of the
+/// Proprietary B range is allocated to ISO 11783 valve messages.
 pub const fn is_proprietary(pgn_value: Pgn) -> bool {
     pgn_value.as_u32() == pgn::PROPRIETARY_A.as_u32() || ProprietaryB::from_pgn(pgn_value).is_some()
 }
