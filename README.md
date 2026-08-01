@@ -58,7 +58,8 @@ on a microcontroller with no allocator, as well as on a laptop.
 | **DM14/DM15/DM16**: memory read, write, and binary data transfer | -73 | ✅ |
 | **Software / ECU / component identification** (`*`-delimited fields) | -71 | ✅ |
 | **ISO 11783 valves**: auxiliary (×16) and general purpose, command/flow/position | ISOBUS | ✅ |
-| Broader PGN/SPN parameter database | -71 | planned |
+| **SPN decoding**: bit extraction, scaling, and J1939's status codes | -71 | ✅ |
+| A comprehensive SPN database (only a starter catalogue today) | -71 | planned |
 
 Everything in the core is `#![no_std]`, `#![deny(unsafe_code)]`, allocation-free,
 and builds for `thumbv7em-none-eabihf`. Every codec is validated against
@@ -204,6 +205,33 @@ if let ClaimAction::Announce(new_claim) = ecu.on_address_claimed(Address::new(0x
 }
 ```
 
+### Read a parameter in engineering units
+
+A PGN tells you which message arrived; an SPN tells you which parameter sits
+where inside it and how to scale it.
+
+```rust
+use sae_j1939_rs::spn::{catalogue, SpnValue};
+
+// An Electronic Engine Controller 1 frame.
+let payload = [0xFF, 0x87, 0x96, 0xE0, 0x2E, 0xFF, 0xFF, 0xFF];
+assert_eq!(catalogue::ENGINE_SPEED.decode(&payload)?, SpnValue::Valid(1500.0));
+```
+
+The reason this returns an `SpnValue` rather than an `f32` is the mistake it
+prevents: J1939 reserves the top of every parameter's range for status, so a
+one-byte parameter reading `0xFF` means **not available** and `0xFE` means
+**error**. A decoder that ignores that reports a disconnected coolant sensor as
+215 °C.
+
+```rust
+assert_eq!(catalogue::ENGINE_COOLANT_TEMPERATURE.decode(&[0xFF; 8])?, SpnValue::NotAvailable);
+```
+
+The catalogue is a starter set of widely published parameters, not the full
+J1939-71 database — `Spn::new` and `bit_position` let you transcribe your own
+definitions straight from a datasheet's `byte.bit` notation.
+
 ### Read diagnostic trouble codes
 
 ```rust
@@ -281,6 +309,9 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
   cansend vcan0 1CEBFF80#0104002B01048364
   cansend vcan0 1CEBFF80#0200018721061FFE
 
+  # ...an engine controller frame, decoded into rpm and percent:
+  cansend vcan0 0CF00400#FF8796E02EFFFFFF
+
   # ...or a complete virtual ECU that claims an address and answers requests:
   cargo run -p sae-j1939-host --example vcan_ecu
   cansend vcan0 18EAFFF9#00EE00        # who is on the bus?
@@ -310,6 +341,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 | `diagnostics` | -73 | DM1/DM2 trouble codes and lamp status |
 | `memory_access` | -73 | DM14/DM15/DM16 memory read, write, and data transfer |
 | `identification` | -71 | Software, ECU, and component identification |
+| `spn` | -71 | Suspect Parameter Numbers: payload bytes to engineering units |
 | `can` | — | Bridge to the `embedded-can` traits |
 
 Note that `can` — not `transport` — holds the CAN frame bridge, because in J1939

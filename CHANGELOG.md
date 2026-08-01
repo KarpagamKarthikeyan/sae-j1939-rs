@@ -9,7 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Planned
 
-- A broader PGN/SPN parameter database (J1939-71).
+- A comprehensive SPN database. The decoding machinery and a starter catalogue
+  ship in 0.1; how a full parameter list should be carried in a `no_std` crate
+  is still open (feature-gated static, build-time generation, or a companion
+  crate).
 - More of ISO 11783 beyond the valve groups (task controller, virtual terminal).
 
 ## [0.1.0] - unreleased
@@ -73,6 +76,13 @@ parameter groups, the ISO 11783 valve groups, and a SocketCAN transport.
     per parameter group, and encoders. Software Identification's leading count
     byte is parsed and can be checked against the fields actually present.
 
+  - `spn` — Suspect Parameter Numbers: bit-field extraction (including fields
+    that straddle byte boundaries), resolution and offset scaling, and
+    `bit_position` for transcribing SAE `byte.bit` notation. `SpnValue`
+    distinguishes a measurement from J1939's in-band *not available*, *error*,
+    and *reserved* codes at every field width, so a status byte cannot be read
+    as a reading. `catalogue` carries 13 widely published definitions.
+
   *ISO 11783 (ISOBUS)*
   - `iso11783` — the auxiliary valve groups (command, estimated flow, measured
     position) for all sixteen valves, and the general purpose valve command and
@@ -102,7 +112,8 @@ parameter groups, the ISO 11783 valve groups, and a SocketCAN transport.
     needs. `transfers_in_flight` and `abandon_transfer` expose the reassembly
     state.
   - `vcan_dump` example — decode live traffic, reassemble multi-packet
-    messages, and pretty-print NAME and DM1/DM2 payloads.
+    messages, and pretty-print NAME, DM1/DM2, and engine parameters in
+    engineering units.
   - `vcan_ecu` example — a complete virtual ECU built on `Node`: claims an
     address, answers requests, and reports three trouble codes over a BAM.
 
