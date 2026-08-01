@@ -396,6 +396,18 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
         for frame in &outgoing {
             self.bus.send_frame(frame)?;
         }
+
+        // A Commanded Address tells this ECU to move. `Node` cannot act on it
+        // inside `on_frame` without copying its reassembly buffer on every
+        // message, but here the payload is already owned, so wire it up and
+        // spare the caller from knowing about it at all.
+        if let Some(message) = &message {
+            if message.pgn == pgn::COMMANDED_ADDRESS {
+                if let Ok(Some(claim)) = self.node.on_commanded_address(&message.data) {
+                    self.bus.send_frame(&claim)?;
+                }
+            }
+        }
         Ok(message)
     }
 
@@ -744,6 +756,48 @@ mod tests {
         );
         assert_eq!(ecu.bus().sent_with_pgn(pgn::TP_CM).len(), 1);
         assert_eq!(ecu.bus().sent_with_pgn(pgn::TP_DT).len(), 2);
+    }
+
+    /// The host layer already owns the payload, so it wires the command up
+    /// without the caller needing to know the PGN exists.
+    #[test]
+    fn a_commanded_address_is_acted_on_without_the_caller_helping() {
+        use sae_j1939_rs::tp::Transmitter;
+
+        let tool = Address::new(0xF9);
+        let mut ecu = ecu_on(FakeBus::default(), name_for(1, 300));
+        ecu.claim_address().unwrap();
+        assert_eq!(ecu.address(), Address::new(0x80));
+
+        // Nine bytes: NAME then the address to take. It travels over the
+        // transport protocol, because it does not fit one frame.
+        let mut command = [0u8; 9];
+        command[..8].copy_from_slice(&ecu.name().to_bytes());
+        command[8] = 0x42;
+
+        let mut tx = Transmitter::broadcast(pgn::COMMANDED_ADDRESS, &command).unwrap();
+        ecu.bus().queue(Frame::from_payload(
+            Id::broadcast(Priority::LOWEST, pgn::TP_CM, tool),
+            tx.start().encode(),
+        ));
+        while let Some(packet) = tx.next_packet() {
+            ecu.bus().queue(Frame::from_payload(
+                Id::broadcast(Priority::LOWEST, pgn::TP_DT, tool),
+                packet.encode(),
+            ));
+        }
+
+        for _ in 0..8 {
+            ecu.poll().unwrap();
+        }
+
+        assert_eq!(ecu.address(), Address::new(0x42), "the ECU moved");
+        // ...and announced the move itself.
+        let claims = ecu.bus().sent_with_pgn(pgn::ADDRESS_CLAIMED);
+        assert_eq!(
+            claims.last().unwrap().id().source_address(),
+            Address::new(0x42)
+        );
     }
 
     #[test]

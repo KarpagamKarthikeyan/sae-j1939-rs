@@ -11,7 +11,7 @@ on a bare-metal ECU *and* on a host (Linux/SocketCAN).
 J1939 is the CAN-based protocol behind heavy vehicles: trucks, agricultural and
 construction equipment, and marine engines.
 
-> **Status: early development (0.1).** The API will change. The J1939-21 data
+> **Status: early development (0.2).** The API will change. The J1939-21 data
 > link and transport layers, J1939-81 network management, J1939-73 diagnostics,
 > the J1939-71 identification groups, and the ISO 11783 valve groups are
 > implemented and tested — see below.
@@ -72,12 +72,12 @@ known-good byte sequences — see [Testing & validation](#testing--validation).
 
 ```toml
 [dependencies]
-sae-j1939-rs = "0.1"      # no_std core: identifiers, PGNs, transport protocol, NAME, diagnostics
-sae-j1939-host = "0.1"    # std host layer: SocketCAN transport
+sae-j1939-rs = "0.2"      # no_std core: identifiers, PGNs, transport protocol, NAME, diagnostics
+sae-j1939-host = "0.2"    # std host layer: Ecu, Bus, SocketCAN transport
 ```
 
 The core is `no_std` by default; enable `std` for `std::error::Error` impls
-(`sae-j1939-rs = { version = "0.1", features = ["std"] }`). On a microcontroller,
+(`sae-j1939-rs = { version = "0.2", features = ["std"] }`). On a microcontroller,
 depend only on `sae-j1939-rs` and drive it with your HAL's [`embedded-can`]
 implementation — no host crate needed. In `sae-j1939-host`, the SocketCAN
 transport is compiled only on Linux. **MSRV: Rust 1.75.**
@@ -391,7 +391,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 For the full picture — layering against the J1939 parts, the PDU1/PDU2 split,
 receive and transmit data flows, transport-protocol sequence diagrams, and the
-address-claiming state machine — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+address-claiming state machine — see **[ARCHITECTURE.md](https://github.com/KarpagamKarthikeyan/sae-j1939-rs/blob/main/ARCHITECTURE.md)**.
 
 - **`core` (`sae-j1939-rs`)** — `no_std`, allocation-free, transport-agnostic.
   Identifier and PGN codecs, the transport protocol, NAME and address claiming,
@@ -446,13 +446,13 @@ Where the two disagree, the standard wins — see the note in
 
 ## Contributing
 
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+Contributions are welcome — see [CONTRIBUTING.md](https://github.com/KarpagamKarthikeyan/sae-j1939-rs/blob/main/CONTRIBUTING.md) for the
 workflow (DCO sign-off, local checks, the `no_std` core vs `host` split, and code
 provenance). Good entry points are issues labelled
 [`good first issue`](https://github.com/KarpagamKarthikeyan/sae-j1939-rs/labels/good%20first%20issue).
 Questions and ideas are welcome in
 [Discussions](https://github.com/KarpagamKarthikeyan/sae-j1939-rs/discussions).
-Participation is governed by our [Code of Conduct](CODE_OF_CONDUCT.md).
+Participation is governed by our [Code of Conduct](https://github.com/KarpagamKarthikeyan/sae-j1939-rs/blob/main/CODE_OF_CONDUCT.md).
 
 ## License
 

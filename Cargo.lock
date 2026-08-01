@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "sae-j1939-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sae-j1939-rs",
  "socketcan",
@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "sae-j1939-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "embedded-can",
  "heapless",

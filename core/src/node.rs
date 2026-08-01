@@ -441,6 +441,50 @@ impl<const BUF: usize, const SESSIONS: usize> Node<BUF, SESSIONS> {
         }
     }
 
+    /// Act on a Commanded Address (PGN `0x00FED8`), taking the address it
+    /// names.
+    ///
+    /// This is network management rather than application data, but it does not
+    /// happen inside [`Node::on_frame`]: the message is nine bytes, so it always
+    /// arrives reassembled, and the delivered payload borrows the reassembly
+    /// buffer. Handling it in place would mean copying that buffer on *every*
+    /// completed message on the chance this was the one. So route it here
+    /// instead — one line, and no cost to messages that are not commands:
+    ///
+    /// ```
+    /// # use sae_j1939_rs::node::{Event, Node};
+    /// # use sae_j1939_rs::{pgn, Address, Frame, Name};
+    /// # fn example(node: &mut Node<256>, frame: &Frame, send: impl Fn(Frame)) {
+    /// match node.on_frame(frame) {
+    ///     Event::Message { pgn, data, .. } if pgn == pgn::COMMANDED_ADDRESS => {
+    ///         // Copy out before the borrow ends, then act.
+    ///         let mut command = [0u8; 9];
+    ///         command.copy_from_slice(&data[..9]);
+    ///         if let Ok(Some(claim)) = node.on_commanded_address(&command) {
+    ///             send(claim); // announce the new address
+    ///         }
+    ///     }
+    ///     _ => {}
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// Returns the Address Claimed frame to broadcast, or `None` if the command
+    /// named a different ECU. A command naming a reserved address is rejected —
+    /// see [`AddressClaimer::on_commanded_address`].
+    ///
+    /// The node re-enters [`ClaimState::Claiming`]: a new address has to be
+    /// claimed like any other, so drive [`Node::tick`] until the window closes.
+    pub fn on_commanded_address(&mut self, data: &[u8]) -> Result<Option<Frame>> {
+        match self.claimer.on_commanded_address(data)? {
+            ClaimAction::Announce(claim) => {
+                self.claim_elapsed_ms = 0;
+                Ok(Some(address_claim_frame(claim.source, claim.name)))
+            }
+            ClaimAction::Idle => Ok(None),
+        }
+    }
+
     /// Give up this node's address, producing the Cannot Claim Address
     /// broadcast to send.
     pub fn give_up_address(&mut self) -> Frame {
@@ -1009,6 +1053,67 @@ mod tests {
             TpCm::decode(sent[0].payload()).unwrap(),
             TpCm::Abort { .. }
         ));
+    }
+
+    /// A tool can move an ECU with a Commanded Address. The new address is not
+    /// simply assumed — it has to be claimed like any other.
+    #[test]
+    fn a_commanded_address_moves_the_node_and_reopens_the_window() {
+        let mut node = node();
+        node.start();
+        node.tick(ADDRESS_CLAIM_WINDOW_MS, |_| {});
+        assert!(node.has_address());
+
+        let mut command = [0u8; 9];
+        command[..8].copy_from_slice(&node.name().to_bytes());
+        command[8] = 0x42;
+
+        let claim = node
+            .on_commanded_address(&command)
+            .unwrap()
+            .expect("the node must announce its new address");
+        assert_eq!(claim.id().source_address(), Address::new(0x42));
+        assert_eq!(node.address(), Address::new(0x42));
+        assert_eq!(
+            node.claim_state(),
+            ClaimState::Claiming,
+            "a commanded address must be claimed, not assumed"
+        );
+
+        // The contention window restarts from the new claim.
+        node.tick(ADDRESS_CLAIM_WINDOW_MS - 1, |_| {});
+        assert!(!node.has_address());
+        node.tick(1, |_| {});
+        assert!(node.has_address());
+    }
+
+    #[test]
+    fn a_commanded_address_for_another_ecu_is_ignored() {
+        let mut node = node();
+        node.start();
+        node.tick(ADDRESS_CLAIM_WINDOW_MS, |_| {});
+
+        let mut command = [0u8; 9];
+        command[..8].copy_from_slice(&name_for(999, 999).to_bytes());
+        command[8] = 0x42;
+
+        assert_eq!(node.on_commanded_address(&command).unwrap(), None);
+        assert_eq!(node.address(), Address::new(0x80));
+        assert_eq!(node.claim_state(), ClaimState::Claimed);
+    }
+
+    #[test]
+    fn a_commanded_address_naming_a_reserved_address_is_refused() {
+        let mut node = node();
+        node.start();
+        node.tick(ADDRESS_CLAIM_WINDOW_MS, |_| {});
+
+        let mut command = [0u8; 9];
+        command[..8].copy_from_slice(&node.name().to_bytes());
+        command[8] = 0xFF;
+
+        assert!(node.on_commanded_address(&command).is_err());
+        assert_eq!(node.address(), Address::new(0x80), "unchanged");
     }
 
     #[test]

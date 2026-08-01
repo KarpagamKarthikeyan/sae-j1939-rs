@@ -15,11 +15,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crate).
 - More of ISO 11783 beyond the valve groups (task controller, virtual terminal).
 
-## [0.1.0] - unreleased
+## [0.2.0] - 2026-08-01
 
-Initial release: the workspace, the J1939-21 data link and transport layers,
-J1939-81 network management, J1939-73 diagnostics, the J1939-71 identification
-parameter groups, the ISO 11783 valve groups, and a SocketCAN transport.
+Everything below landed after 0.1.0 went to crates.io. It is a large release
+for a 0.x: two new protocol areas, a runtime layer for both crates, eight
+protocol defects fixed, and several breaking API changes — listed first.
+
+### Breaking
+
+- `Ecu` is generic over a new `bus::Bus` trait (`Ecu<B, BUF, SESSIONS>`), so the
+  host stack is no longer tied to SocketCAN or to Linux. `SocketCanEcu` is the
+  alias for the Linux case; `Ecu::open` still works through it.
+- `SocketCan` is now a frame transport only. `recv_message`, `send_tp_cm`,
+  `send_tp_dt`, `request`, `transfers_in_flight`, and `abandon_transfer` are
+  gone — they duplicated protocol logic that belongs in the core. Use `Ecu`.
+- `tp::Reassembler` gained a second const parameter, `SESSIONS`. It defaults to
+  1, so `Reassembler::<N>` still compiles.
+- `AddressClaimer::give_up` returns `Claim` rather than a `ClaimAction` whose
+  `Idle` variant was unreachable.
+- `memory_access::Dm14::decode` returns `Self` rather than an always-`Ok`
+  `Result`, matching `Dm15::decode`.
+- `Frame::new` pads unused payload bytes with `0xFF` as J1939 specifies, not
+  zero. `Frame::payload()` therefore reads differently for short frames.
+- `tp::packet_count` saturates at 255 above 1785 bytes instead of wrapping to 0.
+- `Display` and `Debug` on `Id`, `Pgn`, `Address`, `Priority`, `Frame`, `Name`,
+  and `Dtc` are hand-written now. Anything parsing their old derived output
+  will need updating.
 
 ### Added
 
@@ -208,5 +229,16 @@ peer belonged to the transfer in hand.
   (including a licensing-provenance checkbox), and CI covering tests, lint,
   docs, `no_std`, MSRV 1.75, and an on-bus decode.
 
-[Unreleased]: https://github.com/KarpagamKarthikeyan/sae-j1939-rs/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/KarpagamKarthikeyan/sae-j1939-rs/compare/v0.2.0...HEAD
 [0.1.0]: https://github.com/KarpagamKarthikeyan/sae-j1939-rs/releases/tag/v0.1.0
+
+## [0.1.0] - 2026-07-31
+
+First release to crates.io: the J1939-21 data link and transport layers,
+J1939-81 network management, J1939-73 diagnostics, the J1939-71 identification
+parameter groups, and a frame-level Linux SocketCAN transport.
+
+Modules: `types`, `id`, `pgn`, `frame`, `can`, `tp`, `name`, `address_claim`,
+`diagnostics`, `memory_access`, `identification`, `request`; host `transport`.
+
+[0.2.0]: https://github.com/KarpagamKarthikeyan/sae-j1939-rs/compare/v0.1.0...v0.2.0
