@@ -42,17 +42,9 @@ use sae_j1939_rs::tp::{Reassembler, Rx, TpCm, TpDt, MAX_MESSAGE_SIZE};
 pub const CONCURRENT_TRANSFERS: usize = 8;
 use sae_j1939_rs::{pgn, Address, Id, Pgn, Priority};
 
-/// A whole J1939 message, however many CAN frames it took to arrive.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Message {
-    /// The parameter group carried.
-    pub pgn: Pgn,
-    /// The ECU that sent it.
-    pub source: Address,
-    /// The payload: up to eight bytes for a single frame, up to 1785 for a
-    /// transport-protocol transfer.
-    pub data: Vec<u8>,
-}
+use crate::bus::Bus;
+
+pub use crate::bus::Message;
 
 /// A J1939 transport over a Linux SocketCAN interface.
 #[derive(Debug)]
@@ -237,6 +229,29 @@ impl SocketCan {
         let id = Id::from_parts(Priority::LOWEST, pgn::TP_DT, destination, source)
             .map_err(invalid_input)?;
         self.send(id, &dt.encode())
+    }
+}
+
+impl Bus for SocketCan {
+    fn send_frame(&self, frame: &Frame) -> io::Result<()> {
+        SocketCan::send_frame(self, frame)
+    }
+
+    fn recv_frame(&self) -> io::Result<Option<Frame>> {
+        match self.recv() {
+            Ok(frame) => Ok(Some(frame)),
+            // A quiet bus is not a failure; both kinds surface here depending on
+            // whether the socket is blocking or non-blocking.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

@@ -4,9 +4,10 @@
 //! A complete virtual ECU: claims an address, answers requests, reassembles
 //! multi-packet traffic, and reports its own faults.
 //!
-//! This is the whole stack running on a real bus. `Node` does the protocol
-//! work — address claiming, the receive filter, transport-protocol reassembly,
-//! and the CTS/acknowledgement handshake — so this file is mostly I/O.
+//! This is the whole stack running on a real bus. `Ecu` does the protocol work
+//! — address claiming, the receive filter, transport-protocol reassembly, the
+//! CTS/acknowledgement handshake, BAM pacing, and the clock — so what is left
+//! here is just the application: decide what to answer, and answer it.
 //!
 //! ```text
 //! sudo tools/vcan_setup.sh                              # bring up vcan0
@@ -21,14 +22,10 @@
 
 #[cfg(target_os = "linux")]
 fn main() -> std::io::Result<()> {
-    use std::time::{Duration, Instant};
-
+    use sae_j1939_host::ecu::Ecu;
     use sae_j1939_host::sae_j1939_rs::diagnostics::{self, Dtc, Lamp, LampStatus, Lamps};
-    use sae_j1939_host::sae_j1939_rs::node::{Event, Node, ADDRESS_CLAIM_WINDOW_MS};
     use sae_j1939_host::sae_j1939_rs::request::Request;
-    use sae_j1939_host::sae_j1939_rs::tp::Transmitter;
-    use sae_j1939_host::sae_j1939_rs::{name::industry_group, pgn, Address, Frame, Name};
-    use sae_j1939_host::transport::SocketCan;
+    use sae_j1939_host::sae_j1939_rs::{name::industry_group, pgn, Address, Name};
 
     let interface = std::env::args().nth(1).unwrap_or_else(|| "vcan0".into());
 
@@ -40,108 +37,55 @@ fn main() -> std::io::Result<()> {
         .with_industry_group(industry_group::ON_HIGHWAY)
         .with_arbitrary_address_capable(true);
 
-    // Accept messages up to 1785 bytes from up to four peers at once.
-    let mut node = Node::<1785, 4>::new(name, Address::new(0x80));
-
-    let bus = SocketCan::open(&interface)?;
-    bus.set_read_timeout(Duration::from_millis(50))?;
-
-    // Announce ourselves.
-    let claim = node.start();
-    bus.send_frame(&claim)?;
+    // The bus type is inferred as SocketCan; 1785-byte messages from up to
+    // eight peers at once.
+    let mut ecu = Ecu::<_, 1785, 8>::open(&interface, name, Address::new(0x80))?;
     println!(
         "claiming address {:#04x} on {interface}",
-        node.address().as_u8()
+        ecu.address().as_u8()
     );
 
-    // The faults this ECU would report if asked. Three codes exceed one frame,
-    // so answering the request takes a BAM.
+    // Blocks for the 250 ms contention window, handling anything that arrives.
+    ecu.claim_address()?;
+    if !ecu.has_address() {
+        println!("lost arbitration; this ECU is off the bus");
+        return Ok(());
+    }
+    println!("address {:#04x} held", ecu.address().as_u8());
+    println!("listening. Try:  cansend {interface} 18EA80F9#CAFE00");
+
+    // The faults this ECU reports if asked. Three codes exceed one frame, so
+    // answering takes a BAM — which `broadcast` handles, pacing included.
     let lamps = Lamps::new().with_status(Lamp::AmberWarning, LampStatus::On);
     let faults = [
         Dtc::new(100, 1, 2).unwrap(),
         Dtc::new(110, 0, 5).unwrap(),
         Dtc::new(1569, 31, 126).unwrap(),
     ];
-    let mut dm1_payload = [0u8; 64];
-    let dm1_len = diagnostics::encode(lamps, &faults, &mut dm1_payload).unwrap();
-
-    let mut last_tick = Instant::now();
-    let mut announced = false;
+    let mut dm1 = [0u8; 64];
+    let dm1_len = diagnostics::encode(lamps, &faults, &mut dm1).unwrap();
 
     loop {
-        // Anything to send as a result of a frame, collected before the event's
-        // borrow of `node` ends.
-        let mut outgoing: Vec<Frame> = Vec::new();
-        let mut send_dm1 = false;
+        // `poll` returns None on a quiet bus, not at end-of-stream.
+        let Some(message) = ecu.poll()? else {
+            continue;
+        };
 
-        match bus.recv() {
-            Ok(frame) => match node.on_frame(&frame) {
-                Event::Idle => {}
-                Event::Transmit(reply) => outgoing.push(reply),
-                Event::Message {
-                    pgn: group,
-                    source,
-                    data,
-                    reply,
-                } => {
-                    outgoing.extend(reply);
-                    println!(
-                        "{:#08x} from {:#04x}: {} bytes",
-                        group.as_u32(),
-                        source.as_u8(),
-                        data.len()
-                    );
-                    // Someone asking for our active trouble codes.
-                    if group == pgn::REQUEST {
-                        if let Ok(request) = Request::decode(data) {
-                            if request.pgn == pgn::DM1 {
-                                send_dm1 = true;
-                            }
-                        }
-                    }
+        println!(
+            "{:#08x} from {:#04x}: {} bytes",
+            message.pgn.as_u32(),
+            message.source.as_u8(),
+            message.data.len()
+        );
+
+        // Answer a request for our active trouble codes.
+        if message.pgn == pgn::REQUEST {
+            if let Ok(request) = Request::decode(&message.data) {
+                if request.pgn == pgn::DM1 {
+                    ecu.broadcast(pgn::DM1, &dm1[..dm1_len])?;
+                    println!("  -> reported {} active faults over a BAM", faults.len());
                 }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e),
-        }
-
-        for frame in &outgoing {
-            bus.send_frame(frame)?;
-        }
-
-        if send_dm1 {
-            // Three codes do not fit one frame, so broadcast them over a BAM.
-            // J1939-21 wants 50-200 ms between packets; that pacing is ours to
-            // provide, since the state machine owns no clock.
-            let mut tx = Transmitter::broadcast(pgn::DM1, &dm1_payload[..dm1_len]).unwrap();
-            let source = node.address();
-            bus.send_tp_cm(source, Address::GLOBAL, &tx.start())?;
-            while let Some(packet) = tx.next_packet() {
-                std::thread::sleep(Duration::from_millis(50));
-                bus.send_tp_dt(source, Address::GLOBAL, &packet)?;
             }
-            println!("  -> reported {} active faults over a BAM", faults.len());
-        }
-
-        // Advance the node's timers with however long the loop actually took.
-        let elapsed = last_tick.elapsed();
-        last_tick = Instant::now();
-        let elapsed_ms = elapsed.as_millis().min(u16::MAX as u128) as u16;
-
-        let mut timeouts: Vec<Frame> = Vec::new();
-        node.tick(elapsed_ms, |frame| timeouts.push(frame));
-        for frame in &timeouts {
-            println!("  (a stalled transfer timed out; sending abort)");
-            bus.send_frame(frame)?;
-        }
-
-        if !announced && node.has_address() {
-            announced = true;
-            println!(
-                "address {:#04x} held after the {ADDRESS_CLAIM_WINDOW_MS} ms contention window",
-                node.address().as_u8()
-            );
-            println!("listening. Try:  cansend {interface} 18EA80F9#CAFE00");
         }
     }
 }

@@ -12,6 +12,13 @@ categories.workspace = true
 documentation = "https://docs.rs/sae-j1939-host"
 readme = "../README.md"
 
+# The SocketCAN transport and `Ecu` are Linux-only, so docs must be built for a
+# Linux target or the crate would document as empty.
+[package.metadata.docs.rs]
+all-features = true
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
 [dependencies]
 sae-j1939-rs = { workspace = true, features = ["std"] }
 

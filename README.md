@@ -53,6 +53,8 @@ on a microcontroller with no allocator, as well as on a laptop.
 | **DM1 / DM2**: lamp status + trouble codes (SPN/FMI/occurrence) | -73 | ✅ |
 | **DM3**: clear previously active trouble codes | -73 | ✅ |
 | **`Node`**: one type doing claiming, filtering, reassembly, and dispatch | — | ✅ |
+| **`Ecu`**: `Node` on any `Bus` — clock, BAM pacing, RTS/CTS handshake | — | ✅ |
+| Pluggable transport (`Bus` trait): SocketCAN, an adapter SDK, or a simulator | — | ✅ |
 | `embedded-can` bridge + SocketCAN transport with message reassembly | — | ✅ |
 | **Request and Acknowledgement** parameter groups | -21 | ✅ |
 | **DM14/DM15/DM16**: memory read, write, and binary data transfer | -73 | ✅ |
@@ -81,12 +83,43 @@ transport is compiled only on Linux. **MSRV: Rust 1.75.**
 
 ## Quickstart
 
-### Run a whole ECU
+### Run a whole ECU on Linux
 
-`Node` wires the protocol layers together: it filters frames by destination,
-claims and defends an address, routes transport-protocol traffic to a
-reassembler, and answers the CTS and end-of-message handshakes itself. Feed it
-frames; it tells you what to send and what arrived.
+`Ecu` is the shortest path to a working node: it owns the socket and the clock,
+claims an address, reassembles multi-packet traffic, and splits long messages
+across the transport protocol on the way out.
+
+```rust
+use sae_j1939_host::ecu::Ecu;
+use sae_j1939_host::sae_j1939_rs::{pgn, Address, Name};
+
+let name = Name::new().with_manufacturer_code(300).with_identity_number(4242);
+let mut ecu = Ecu::open("can0", name, Address::new(0x80))?;
+
+ecu.claim_address()?;                                  // blocks 250 ms, handles contention
+ecu.request(Address::GLOBAL, pgn::ADDRESS_CLAIMED)?;   // who else is here?
+
+loop {
+    // `poll` returns None whenever the bus is quiet — drive it in a loop, not
+    // `while let Some(..)`, which would stop at the first gap in traffic.
+    if let Some(message) = ecu.poll()? {
+        println!("{:#08x} from {:#04x}", message.pgn.as_u32(), message.source.as_u8());
+    }
+}
+
+// Longer than eight bytes? It goes out over the transport protocol, paced.
+let mut dm1 = [0u8; 64];
+let len = diagnostics::encode(lamps, &three_faults, &mut dm1)?;   // 14 bytes
+ecu.broadcast(pgn::DM1, &dm1[..len])?;
+```
+
+### ...or drive the protocol yourself
+
+`Node` is the same logic without the I/O: `no_std`, no clock, no socket. It
+filters frames by destination, claims and defends an address, routes
+transport-protocol traffic to a reassembler, and answers the CTS and
+end-of-message handshakes itself. Feed it frames; it tells you what to send and
+what arrived.
 
 ```rust
 use sae_j1939_rs::node::{Event, Node};
@@ -116,9 +149,9 @@ loop {
 }
 ```
 
-It stays sans-I/O: `Node` owns no bus and no clock. You hand it frames and
-elapsed milliseconds, so the same code is testable on a host and runs on an MCU.
-Everything below is the layer underneath, for when you want only part of it.
+This is what runs on a microcontroller, and it is what `Ecu` is built from.
+Everything below is the layer underneath again, for when you want only part of
+it.
 
 ### Decode a frame off the bus
 
@@ -285,6 +318,12 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
   `0x18FECA..`), the NAME test reproduces the reference's bit-packing field by
   field, and the TP.CM control bytes match J1939-21 exactly.
 
+- **Exhaustive sweeps, not just examples.** `core/tests/codec_sweep.rs` walks
+  the whole input space where that is feasible: all 262,144 PGNs, every
+  identifier prefix, every value of every bit-packed field, and the reserved-range
+  boundary at all 32 SPN field widths. Bit-packing bugs hide in the values nobody
+  picks as an example, and this sweep found one the day it was written.
+
 - **The two halves are tested against each other.** `Transmitter` drives a real
   `Reassembler` across every message size from 9 to 1785 bytes and the original
   payload comes back out; a 3-code DM1, a DM16 memory read, and an ECU
@@ -325,8 +364,11 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
   and diagnostics. Everything is **sans-I/O**: it consumes and produces frames
   but never touches a bus and owns no clock, so the same logic runs on host and
   MCU. CAN frames flow through the [`embedded-can`] traits.
-- **`host` (`sae-j1939-host`)** — `std` layer on the core: a Linux SocketCAN
-  transport that reassembles multi-packet messages for you, gated to Linux.
+- **`host` (`sae-j1939-host`)** — `std` layer on the core. `Ecu` adds the clock
+  and the message splitting a host program would otherwise write itself, over
+  anything implementing the two-method `Bus` trait. The SocketCAN implementation
+  of `Bus` is gated to Linux; `Ecu` itself is not, so it can be driven by a
+  simulator, an adapter SDK, or a test double on any platform.
 
 | Module | J1939 part | What it covers |
 |--------|-----------|----------------|

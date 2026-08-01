@@ -64,8 +64,10 @@ pub const MAX_BIT_LENGTH: u16 = 32;
 /// use sae_j1939_rs::spn::bit_position;
 ///
 /// assert_eq!(bit_position(1, 1), 0);   // the very first bit
+/// assert_eq!(bit_position(1, 8), 7);   // ...and the last bit of byte 1
+/// assert_eq!(bit_position(2, 1), 8);   // byte 2 starts here
+/// assert_eq!(bit_position(2, 3), 10);  // two bits into byte 2
 /// assert_eq!(bit_position(4, 1), 24);  // engine speed starts at byte 4
-/// assert_eq!(bit_position(2, 3), 11);
 /// ```
 pub const fn bit_position(byte: u16, bit: u16) -> u16 {
     (byte - 1) * 8 + (bit - 1)
@@ -220,36 +222,60 @@ impl Spn {
     }
 }
 
-/// Classify a raw field against the reserved ranges J1939-71 defines at the top
-/// of every parameter.
+/// Classify a raw field against the reserved values at the top of a parameter's
+/// range.
 ///
-/// The pattern is the same at every width: the highest value means *not
-/// available*, the one below it means *error*, and a small band under that is
-/// reserved. For fields wider than a byte the classification is driven by the
-/// most significant byte, so a 16-bit parameter is unavailable across all of
-/// `0xFF00..=0xFFFF`, not only at `0xFFFF`.
+/// The universal rule is that the **highest** value of a field means *not
+/// available* and the one below it means *error*. On top of that, J1939-71
+/// documents a reserved band for the widths it tabulates:
+///
+/// | Width | Valid | Reserved | Error | Not available |
+/// |-------|-------|----------|-------|---------------|
+/// | 1 bit | both values | — | — | — |
+/// | 2 bits | `0`–`1` | — | `2` | `3` |
+/// | 4 bits | `0x0`–`0xA` | `0xB`–`0xD` | `0xE` | `0xF` |
+/// | 8 bits | `0x00`–`0xFA` | `0xFB`–`0xFD` | `0xFE` | `0xFF` |
+/// | > 8 bits | top byte `≤ 0xFA` | top byte `0xFB`–`0xFD` | top byte `0xFE` | top byte `0xFF` |
+///
+/// Widths the standard does not tabulate — 3, and 5 through 7 — get the general
+/// top-two rule with no reserved band, since there is no documented one to
+/// apply. Such fields are rare; a 1-bit field is the only case with no room for
+/// status at all, so both its values are measurements.
 const fn classify(raw: u32, bit_length: u16) -> RawValue {
     match bit_length {
+        // No room for status codes.
         1 => RawValue::Valid(raw),
         2 => match raw {
             0 | 1 => RawValue::Valid(raw),
             2 => RawValue::Error,
             _ => RawValue::NotAvailable,
         },
-        3..=4 => match raw {
+        4 => match raw {
             0x0..=0xA => RawValue::Valid(raw),
             0xB..=0xD => RawValue::Reserved,
             0xE => RawValue::Error,
             _ => RawValue::NotAvailable,
         },
-        5..=8 => match raw {
+        8 => match raw {
             0x00..=0xFA => RawValue::Valid(raw),
             0xFB..=0xFD => RawValue::Reserved,
             0xFE => RawValue::Error,
             _ => RawValue::NotAvailable,
         },
+        // Widths the standard does not tabulate: the top two values only.
+        3 | 5..=7 => {
+            let max = (1u32 << bit_length) - 1;
+            if raw == max {
+                RawValue::NotAvailable
+            } else if raw == max - 1 {
+                RawValue::Error
+            } else {
+                RawValue::Valid(raw)
+            }
+        }
+        // Wider fields are classified by their most significant byte, so a
+        // 16-bit parameter is unavailable across all of 0xFF00..=0xFFFF.
         _ => {
-            // Wider fields are classified by their top byte.
             let top = raw >> (bit_length - 8);
             match top {
                 0x00..=0xFA => RawValue::Valid(raw),
@@ -546,6 +572,18 @@ mod tests {
         let one_bit = Spn::new(0, "test", 0, 1, 1.0, 0.0, "");
         assert_eq!(one_bit.extract(&[0]), Ok(RawValue::Valid(0)));
         assert_eq!(one_bit.extract(&[1]), Ok(RawValue::Valid(1)));
+
+        // Widths the standard does not tabulate still reserve their top two
+        // values, so an all-ones field is never a measurement.
+        let three_bit = Spn::new(0, "test", 0, 3, 1.0, 0.0, "");
+        assert_eq!(three_bit.extract(&[0b101]), Ok(RawValue::Valid(5)));
+        assert_eq!(three_bit.extract(&[0b110]), Ok(RawValue::Error));
+        assert_eq!(three_bit.extract(&[0b111]), Ok(RawValue::NotAvailable));
+
+        let six_bit = Spn::new(0, "test", 0, 6, 1.0, 0.0, "");
+        assert_eq!(six_bit.extract(&[60]), Ok(RawValue::Valid(60)));
+        assert_eq!(six_bit.extract(&[62]), Ok(RawValue::Error));
+        assert_eq!(six_bit.extract(&[63]), Ok(RawValue::NotAvailable));
     }
 
     #[test]

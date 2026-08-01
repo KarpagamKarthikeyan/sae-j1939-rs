@@ -59,18 +59,16 @@ jobs:
       - run: cargo test -p sae-j1939-rs --all-features
 
   vcan:
-    name: on-bus frame decode (vcan0)
+    name: on-bus end-to-end (vcan0)
     runs-on: ubuntu-latest
     # The vcan kernel module is not guaranteed on hosted runners; this job runs
     # the on-bus test opportunistically and does not block CI. The authoritative
-    # on-bus validation is `tools/vcan_setup.sh` + this example on your own box.
+    # on-bus validation is `tools/vcan_setup.sh` + the examples on your own box.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Bring up a virtual CAN interface, then run the SocketCAN transport
-      # end-to-end over it.
       - name: Set up vcan0
         run: |
           sudo apt-get update
@@ -79,9 +77,48 @@ jobs:
           sudo ip link add dev vcan0 type vcan
           sudo ip link set up vcan0
           ip -details -brief link show vcan0
-      - name: Decode injected J1939 traffic
+
+      - name: Build the examples
+        run: cargo build -p sae-j1939-host --examples
+
+      # Run a real ECU on the bus and check it answers. This asserts on the
+      # traffic rather than just checking the process starts.
+      - name: A virtual ECU claims an address and answers requests
         run: |
-          # Inject a DM1 broadcast and an addressed Request once the dumper is up.
-          (sleep 2 && cansend vcan0 18FECA80#0100000000000000 \
-                   && cansend vcan0 18EA9080#00EE0000000000) &
-          cargo run -p sae-j1939-host --example vcan_dump
+          set -euo pipefail
+          candump -L vcan0 > /tmp/bus.log &
+          CANDUMP=$!
+          ./target/debug/examples/vcan_ecu vcan0 > /tmp/ecu.log 2>&1 &
+          ECU=$!
+          sleep 2
+
+          # Ask the whole bus to identify itself, then ask 0x80 for its faults.
+          cansend vcan0 18EAFFF9#00EE00
+          sleep 1
+          cansend vcan0 18EA80F9#CAFE00
+          sleep 2
+
+          kill $ECU $CANDUMP 2>/dev/null || true
+          sleep 1
+          echo "----- ECU output -----"; cat /tmp/ecu.log
+          echo "----- bus traffic -----"; cat /tmp/bus.log
+
+          # The ECU must have claimed address 0x80 (Address Claimed, PGN 0xEE00).
+          grep -qi "18EEFF80" /tmp/bus.log \
+            || { echo "FAIL: no address claim from 0x80"; exit 1; }
+          # ...and answered the DM1 request over the transport protocol.
+          grep -qi "1CECFF80" /tmp/bus.log \
+            || { echo "FAIL: no BAM announcing the DM1 response"; exit 1; }
+          grep -qi "1CEBFF80" /tmp/bus.log \
+            || { echo "FAIL: no TP.DT packets carrying the DM1"; exit 1; }
+          echo "PASS: address claimed and a multi-packet DM1 was broadcast"
+
+      - name: The traffic decoder reads a live engine frame
+        run: |
+          set -euo pipefail
+          (sleep 2 && cansend vcan0 0CF00400#FF8796E02EFFFFFF) &
+          timeout 20 ./target/debug/examples/vcan_dump vcan0 > /tmp/dump.log 2>&1 || true
+          cat /tmp/dump.log
+          grep -q "Engine Speed = 1500.00 rpm" /tmp/dump.log \
+            || { echo "FAIL: engine speed not decoded"; exit 1; }
+          echo "PASS: SPN decoding works on live traffic"

@@ -57,12 +57,28 @@ implementation, used for structure and for known-good frames.
 
 ## Building and testing
 
+One command runs every gate CI enforces, and fails on the first problem:
+
 ```bash
-cargo test --workspace                                        # unit + integration + doctests
+tools/check.sh            # fmt, clippy, tests (incl. doctests), docs, no_std
+tools/check.sh --full     # ...plus MSRV, a Linux cross-lint, and packaging
+```
+
+Use `--full` before opening a PR. The cross-lint matters if you are not on
+Linux: the SocketCAN transport is `cfg`-gated, so it is never compiled — and
+never linted — on macOS or Windows without it.
+
+The individual steps, if you prefer to run them piecemeal:
+
+```bash
+cargo test --workspace --all-features                         # unit + integration + doctests
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 cargo build -p sae-j1939-rs --target thumbv7em-none-eabihf    # confirm the core stays no_std
 ```
+
+Note that `cargo test` covers **doctests**, and the examples in doc comments are
+real assertions — a wrong number in a doc comment is a failing test, not a typo.
 
 On Linux you can also exercise the transport on a virtual CAN bus, no hardware
 required:

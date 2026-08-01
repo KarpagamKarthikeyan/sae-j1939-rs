@@ -104,6 +104,18 @@ parameter groups, the ISO 11783 valve groups, and a SocketCAN transport.
   - `std` feature enabling `std::error::Error` for `Error`.
 
 - **`sae-j1939-host` (`std` host layer)**
+  - `bus::Bus` — the transport boundary, two methods wide. `Ecu` is generic over
+    it, so the host stack is not tied to SocketCAN or to Linux: an adapter SDK,
+    a simulator, a log replay, or a test double all work.
+  - `Ecu` — a running node: owns the bus and the clock, claims an address,
+    reassembles incoming multi-packet transfers, and splits outgoing messages
+    over the transport protocol (BAM with J1939-21 pacing for broadcasts, the
+    full RTS/CTS handshake for addressed sends). Traffic arriving mid-handshake
+    is queued rather than dropped. `claim_address` waits for arbitration to
+    *settle*, including the fresh contention window that opens when a competing
+    claim forces a relocation, and queues any ordinary traffic that arrives
+    during the window rather than discarding it. Transmitting before an address
+    is claimed is refused, per J1939-81.
   - `SocketCan` — Linux SocketCAN transport: `send`, `send_frame`, `recv`
     (skipping non-J1939 traffic), and `request` for the J1939 Request PGN.
   - `SocketCan::recv_message` — returns whole J1939 messages, transparently
@@ -116,6 +128,16 @@ parameter groups, the ISO 11783 valve groups, and a SocketCAN transport.
     engineering units.
   - `vcan_ecu` example — a complete virtual ECU built on `Node`: claims an
     address, answers requests, and reports three trouble codes over a BAM.
+
+- **CI** — the on-bus job now asserts on real traffic rather than just starting
+  the examples: a virtual ECU must claim `0x80`, and must answer a DM1 request
+  with a BAM plus TP.DT packets; the decoder must read 1500 rpm from a live
+  engine frame.
+
+- **Testing** — `tools/check.sh` runs every gate and fails on the first problem.
+  `core/tests/codec_sweep.rs` sweeps the whole input space where feasible: all
+  262,144 PGNs, every identifier prefix, every bit-packed field value, and the
+  reserved-range boundary at all 32 SPN widths.
 
 - **Project setup** — dual MIT/Apache-2.0 licensing, DCO-based contribution
   policy, Contributor Covenant code of conduct, issue and PR templates

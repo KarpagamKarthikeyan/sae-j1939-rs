@@ -11,6 +11,15 @@
 
 pub use sae_j1939_rs;
 
+/// The transport boundary: what an [`ecu::Ecu`] needs from a CAN bus.
+pub mod bus;
+
+/// A running ECU: a bus and the protocol stack wired together.
+///
+/// Start here unless you need the pieces separately. Generic over
+/// [`bus::Bus`], so it is not tied to SocketCAN or to Linux.
+pub mod ecu;
+
 /// Linux SocketCAN transport (compiled only on `target_os = "linux"`).
 #[cfg(target_os = "linux")]
 pub mod transport;

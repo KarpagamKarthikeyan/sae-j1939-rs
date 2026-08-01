@@ -12,6 +12,11 @@ categories.workspace = true
 documentation = "https://docs.rs/sae-j1939-rs"
 readme = "../README.md"
 
+# docs.rs builds with default features unless told otherwise, which would hide
+# everything behind `std`.
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
 embedded-can.workspace = true
 
