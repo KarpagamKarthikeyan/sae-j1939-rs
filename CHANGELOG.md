@@ -135,10 +135,17 @@ parameter groups, the ISO 11783 valve groups, and a SocketCAN transport.
   with a BAM plus TP.DT packets; the decoder must read 1500 rpm from a live
   engine frame.
 
+- **Examples** — `mcu_node` shows the shape of a bare-metal ECU: fixed buffers
+  sized by const parameters, a CAN peripheral behind the `embedded-can` traits,
+  and a counter standing in for `SysTick`. It runs on a host so the logic can be
+  watched without hardware.
+
 - **Testing** — `tools/check.sh` runs every gate and fails on the first problem.
   `core/tests/codec_sweep.rs` sweeps the whole input space where feasible: all
   262,144 PGNs, every identifier prefix, every bit-packed field value, and the
-  reserved-range boundary at all 32 SPN widths.
+  reserved-range boundary at all 32 SPN widths. `core/tests/robustness.rs`
+  asserts that arbitrary bytes cannot panic any decoder or the top-level
+  dispatch.
 
 - **Project setup** — dual MIT/Apache-2.0 licensing, DCO-based contribution
   policy, Contributor Covenant code of conduct, issue and PR templates

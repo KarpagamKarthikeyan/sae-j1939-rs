@@ -323,6 +323,12 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
   `0x18FECA..`), the NAME test reproduces the reference's bit-packing field by
   field, and the TP.CM control bytes match J1939-21 exactly.
 
+- **Nothing on the bus can panic the stack.** `core/tests/robustness.rs` feeds
+  arbitrary bytes to every public decoder and to the top-level `Node::on_frame`
+  dispatch — 160,000 rounds from a deterministic generator, so any failure
+  reproduces from its seed. A panic in a decoder is not a bug report; on an MCU
+  it is an ECU that stops controlling something.
+
 - **Exhaustive sweeps, not just examples.** `core/tests/codec_sweep.rs` walks
   the whole input space where that is feasible: all 262,144 PGNs, every
   identifier prefix, every value of every bit-packed field, and the reserved-range
@@ -352,6 +358,9 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
   cansend vcan0 1CECFF80#200E0002FFCAFE00
   cansend vcan0 1CEBFF80#0104002B01048364
   cansend vcan0 1CEBFF80#0200018721061FFE
+
+  # ...and with no hardware at all, the shape of a bare-metal ECU:
+  cargo run -p sae-j1939-rs --example mcu_node
 
   # ...an engine controller frame, decoded into rpm and percent:
   cansend vcan0 0CF00400#FF8796E02EFFFFFF
