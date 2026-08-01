@@ -55,7 +55,7 @@ on a microcontroller with no allocator, as well as on a laptop.
 | **`Node`**: one type doing claiming, filtering, reassembly, and dispatch | — | ✅ |
 | **`Ecu`**: `Node` on any `Bus` — clock, BAM pacing, RTS/CTS handshake | — | ✅ |
 | Pluggable transport (`Bus` trait): SocketCAN, an adapter SDK, or a simulator | — | ✅ |
-| `embedded-can` bridge + SocketCAN transport with message reassembly | — | ✅ |
+| `embedded-can` bridge + a frame-level Linux SocketCAN transport | — | ✅ |
 | **Request and Acknowledgement** parameter groups | -21 | ✅ |
 | **DM14/DM15/DM16**: memory read, write, and binary data transfer | -73 | ✅ |
 | **Software / ECU / component identification** (`*`-delimited fields) | -71 | ✅ |
@@ -90,11 +90,11 @@ claims an address, reassembles multi-packet traffic, and splits long messages
 across the transport protocol on the way out.
 
 ```rust
-use sae_j1939_host::ecu::Ecu;
+use sae_j1939_host::ecu::SocketCanEcu;
 use sae_j1939_host::sae_j1939_rs::{pgn, Address, Name};
 
 let name = Name::new().with_manufacturer_code(300).with_identity_number(4242);
-let mut ecu = Ecu::open("can0", name, Address::new(0x80))?;
+let mut ecu = SocketCanEcu::open("can0", name, Address::new(0x80))?;
 
 ecu.claim_address()?;                                  // blocks 250 ms, handles contention
 ecu.request(Address::GLOBAL, pgn::ADDRESS_CLAIMED)?;   // who else is here?
@@ -282,26 +282,31 @@ for dtc in dm.dtcs() {
 Two or more trouble codes overflow a CAN frame, which is exactly why DM1 needs
 the transport protocol — `encode` produces the payload and `Transmitter` ships it.
 
-### Read whole messages over SocketCAN
+### Bring your own transport
+
+`Ecu` is generic over a two-method `Bus` trait, so it is not tied to SocketCAN or
+to Linux — an adapter SDK, a simulator, a log being replayed, or a test double
+all work:
 
 ```rust
-use sae_j1939_host::sae_j1939_rs::{pgn, Address};
-use sae_j1939_host::transport::SocketCan;
+use sae_j1939_host::bus::Bus;
+use sae_j1939_host::sae_j1939_rs::Frame;
 
-let mut bus = SocketCan::open("can0")?;      // or "vcan0" for a virtual bus
-let this_ecu = Address::new(0x80);
+impl Bus for MyAdapter {
+    fn send_frame(&self, frame: &Frame) -> std::io::Result<()> { /* ... */ }
+    fn recv_frame(&self) -> std::io::Result<Option<Frame>> { /* None when quiet */ }
+}
 
-bus.request(this_ecu, Address::GLOBAL, pgn::ADDRESS_CLAIMED)?;
-
-// Multi-packet transfers are reassembled for you — CTS and end-of-message
-// acknowledgements are sent automatically.
-let message = bus.recv_message(this_ecu)?;
-println!("PGN {:#08x}: {} bytes", message.pgn.as_u32(), message.data.len());
+let mut ecu = Ecu::<_, 1785, 8>::new(MyAdapter::new()?, name, Address::new(0x80));
 ```
 
-On a microcontroller, use `sae_j1939_rs::can::{frame_from, j1939_id}` with any
-HAL implementing the [`embedded-can`] traits instead of SocketCAN — the protocol
-code is identical.
+`SocketCan` is simply the implementation that ships. It is a frame layer and
+nothing more — every protocol rule lives in the core, so there is only ever one
+implementation of each to get right.
+
+On a microcontroller, skip the host crate entirely: use
+`sae_j1939_rs::can::{frame_from, j1939_id}` with any HAL implementing the
+[`embedded-can`] traits. The protocol code is identical.
 
 ## Testing & validation
 

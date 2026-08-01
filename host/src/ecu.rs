@@ -102,6 +102,15 @@ pub struct Ecu<B: Bus, const BUF: usize = 1785, const SESSIONS: usize = 8> {
     last_tick: Instant,
 }
 
+/// An [`Ecu`] on a Linux SocketCAN interface, sized for a host.
+///
+/// Const-generic defaults on a struct do not apply when you call an associated
+/// function, so `Ecu::open(..)` cannot infer `BUF` and `SESSIONS`. This alias
+/// pins both, which is what makes [`SocketCanEcu::open`] usable without turbofish.
+/// Use `Ecu::<_, BUF, SESSIONS>::open` if you want different sizes.
+#[cfg(target_os = "linux")]
+pub type SocketCanEcu = Ecu<crate::transport::SocketCan, 1785, 8>;
+
 /// Bind to a Linux CAN interface.
 #[cfg(target_os = "linux")]
 impl<const BUF: usize, const SESSIONS: usize> Ecu<crate::transport::SocketCan, BUF, SESSIONS> {
@@ -110,11 +119,13 @@ impl<const BUF: usize, const SESSIONS: usize> Ecu<crate::transport::SocketCan, B
     /// Nothing goes on the bus until [`Ecu::claim_address`] is called.
     ///
     /// ```no_run
-    /// use sae_j1939_host::ecu::Ecu;
+    /// use sae_j1939_host::ecu::SocketCanEcu;
     /// use sae_j1939_host::sae_j1939_rs::{pgn, Address, Name};
     ///
     /// let name = Name::new().with_manufacturer_code(300).with_identity_number(4242);
-    /// let mut ecu = Ecu::open("can0", name, Address::new(0x80))?;
+    /// // `SocketCanEcu` pins the buffer sizes; `Ecu::<_, BUF, SESSIONS>::open`
+    /// // if you want different ones.
+    /// let mut ecu = SocketCanEcu::open("can0", name, Address::new(0x80))?;
     ///
     /// ecu.claim_address()?;
     /// ecu.request(Address::GLOBAL, pgn::ADDRESS_CLAIMED)?;

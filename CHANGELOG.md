@@ -107,6 +107,9 @@ parameter groups, the ISO 11783 valve groups, and a SocketCAN transport.
   - `bus::Bus` — the transport boundary, two methods wide. `Ecu` is generic over
     it, so the host stack is not tied to SocketCAN or to Linux: an adapter SDK,
     a simulator, a log replay, or a test double all work.
+  - `SocketCanEcu` — `Ecu<SocketCan, 1785, 8>`. Const-generic defaults do not
+    apply to associated-function calls, so this alias is what makes
+    `SocketCanEcu::open("can0", ..)` work without a turbofish.
   - `Ecu` — a running node: owns the bus and the clock, claims an address,
     reassembles incoming multi-packet transfers, and splits outgoing messages
     over the transport protocol (BAM with J1939-21 pacing for broadcasts, the
@@ -116,13 +119,11 @@ parameter groups, the ISO 11783 valve groups, and a SocketCAN transport.
     claim forces a relocation, and queues any ordinary traffic that arrives
     during the window rather than discarding it. Transmitting before an address
     is claimed is refused, per J1939-81.
-  - `SocketCan` — Linux SocketCAN transport: `send`, `send_frame`, `recv`
-    (skipping non-J1939 traffic), and `request` for the J1939 Request PGN.
-  - `SocketCan::recv_message` — returns whole J1939 messages, transparently
-    reassembling multi-packet transfers from up to eight peers at once and
-    sending the CTS and end-of-message acknowledgements an RTS/CTS transfer
-    needs. `transfers_in_flight` and `abandon_transfer` expose the reassembly
-    state.
+  - `SocketCan` — the Linux SocketCAN implementation of `Bus`, and nothing
+    more: `open`, `send`, `send_frame`, `recv` (skipping remote, error, and
+    11-bit frames), and the two timeout controls. Reassembly and address
+    management deliberately live in the core instead, so each protocol rule has
+    exactly one implementation.
   - `vcan_dump` example — decode live traffic, reassemble multi-packet
     messages, and pretty-print NAME, DM1/DM2, and engine parameters in
     engineering units.

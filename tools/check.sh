@@ -62,6 +62,26 @@ if (( full )); then
         exit 1
     fi
 
+    # Doctests on `cfg(target_os = "linux")` items are invisible to every check
+    # above when running on macOS or Windows: the items simply do not exist, so
+    # nothing compiles them. Cross-compiling surfaces them. `no_run` doctests are
+    # compile-only, so they verify fully; runnable ones fail at the link stage,
+    # which is expected here and not a real failure.
+    step "Linux-only doctests compile-check"
+    doc_out=$(cargo test -p sae-j1939-host --doc --target "$CROSS_TARGET" 2>&1 || true)
+    if grep -qE '^error\[E[0-9]+\]' <<<"$doc_out"; then
+        grep -E '^error' -A8 <<<"$doc_out" >&2
+        echo >&2
+        echo "FAIL: a Linux-only doctest does not compile." >&2
+        echo "      Mark it 'no_run' so it is compile-checked here, or fix it." >&2
+        exit 1
+    fi
+    if grep -qE 'linking with .cc. failed' <<<"$doc_out"; then
+        echo "note: runnable doctests could not be linked for $CROSS_TARGET." >&2
+        echo "      Expected when cross-compiling; CI runs them natively." >&2
+    fi
+    echo "No compile errors in Linux-only doctests."
+
     step "cargo package (both crates)"
     cargo package -p sae-j1939-rs --allow-dirty --no-verify
 fi

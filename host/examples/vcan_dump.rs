@@ -28,14 +28,12 @@
 
 #[cfg(target_os = "linux")]
 fn main() -> std::io::Result<()> {
-    use std::time::Duration;
-
+    use sae_j1939_host::ecu::SocketCanEcu;
     use sae_j1939_host::sae_j1939_rs::diagnostics::{
         Lamp, LampStatus, Message as DiagnosticMessage,
     };
     use sae_j1939_host::sae_j1939_rs::spn::{catalogue, Spn, SpnValue};
     use sae_j1939_host::sae_j1939_rs::{pgn, Address, Name, Pgn};
-    use sae_j1939_host::transport::SocketCan;
 
     /// The parameters this dumper knows how to read, grouped by the PGN that
     /// carries them. An SPN is only meaningful inside its own parameter group.
@@ -81,26 +79,38 @@ fn main() -> std::io::Result<()> {
     }
 
     let interface = std::env::args().nth(1).unwrap_or_else(|| "vcan0".into());
-    let this_ecu = Address::new(0x80);
 
-    let mut bus = SocketCan::open(&interface)?;
-    bus.set_read_timeout(Duration::from_secs(5))?;
-    println!("listening on {interface} as ECU {:#04x}", this_ecu.as_u8());
+    // A listener still needs an address of its own to request anything.
+    let name = Name::new()
+        .with_identity_number(1)
+        .with_manufacturer_code(300)
+        .with_arbitrary_address_capable(true);
+    let mut ecu = SocketCanEcu::open(&interface, name, Address::new(0xF9))?;
+    ecu.claim_address()?;
+    if !ecu.has_address() {
+        println!("could not claim an address on {interface}");
+        return Ok(());
+    }
+    println!("listening on {interface} as {:#04x}", ecu.address().as_u8());
 
     // Ask every ECU on the bus to announce itself.
-    bus.request(this_ecu, Address::GLOBAL, pgn::ADDRESS_CLAIMED)?;
+    ecu.request(Address::GLOBAL, pgn::ADDRESS_CLAIMED)?;
     println!("sent a global request for the Address Claimed PGN\n");
 
+    let quiet_limit = 100; // ~5 s of empty polls
+    let mut quiet = 0;
+
     loop {
-        let message = match bus.recv_message(this_ecu) {
-            Ok(message) => message,
-            // A read timeout is the expected end of a quiet bus, not a failure.
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                println!("(no traffic for 5s — exiting)");
+        // `poll` returns None on a quiet bus, not at end-of-stream.
+        let Some(message) = ecu.poll()? else {
+            quiet += 1;
+            if quiet >= quiet_limit {
+                println!("(no traffic for a while — exiting)");
                 return Ok(());
             }
-            Err(e) => return Err(e),
+            continue;
         };
+        quiet = 0;
 
         println!(
             "PGN {:#08x} from {:#04x}  ({} bytes)  {:02X?}",
@@ -124,8 +134,7 @@ fn main() -> std::io::Result<()> {
             );
         } else if !parameters_for(message.pgn).is_empty() {
             // A parameter group we can read: print each parameter in its unit,
-            // and say plainly when a value is a status code rather than a
-            // measurement.
+            // and say plainly when a value is a status code, not a measurement.
             for spn in parameters_for(message.pgn) {
                 match spn.decode(&message.data) {
                     Ok(SpnValue::Valid(value)) => {

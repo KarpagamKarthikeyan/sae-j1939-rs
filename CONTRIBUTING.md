@@ -64,9 +64,14 @@ tools/check.sh            # fmt, clippy, tests (incl. doctests), docs, no_std
 tools/check.sh --full     # ...plus MSRV, a Linux cross-lint, and packaging
 ```
 
-Use `--full` before opening a PR. The cross-lint matters if you are not on
-Linux: the SocketCAN transport is `cfg`-gated, so it is never compiled — and
-never linted — on macOS or Windows without it.
+Use `--full` before opening a PR. The cross-target steps matter if you are not
+on Linux: the SocketCAN transport is `cfg`-gated, so on macOS or Windows it is
+never compiled, never linted, and its doc examples are never checked. `--full`
+cross-compiles to catch all three.
+
+One residual gap, since cross-compiled binaries cannot run here: a *runnable*
+doctest on a Linux-only item is compile-checked but not executed locally. Mark
+such examples `no_run` where you can — CI runs them natively either way.
 
 The individual steps, if you prefer to run them piecemeal:
 
@@ -112,6 +117,13 @@ If you're unsure, ask in the issue — "core vs host" is the most common questio
   `thumbv7em-none-eabihf`.
 - **Documented** — public APIs have doc comments; a runnable doctest is a plus.
   Cite the relevant J1939 part (e.g. "J1939-21 §5.10.1") where it clarifies intent.
+
+  Two things that will fail CI if you miss them:
+  - **Doc examples are real tests.** A wrong number in a doc comment is a
+    failing test, not a typo. `cargo test` runs them.
+  - **Fully qualify intra-doc links in `//!` module docs** — write
+    ``[`Bus`](crate::bus::Bus)``, not ``[`Bus`]``. Bare names resolve
+    inconsistently there, and a broken link fails `cargo doc -D warnings`.
 - **Signed off** — DCO (`git commit -s`).
 
 CI enforces the test/lint/fmt/no_std/MSRV gates, so you'll get fast feedback.

@@ -22,7 +22,7 @@
 
 #[cfg(target_os = "linux")]
 fn main() -> std::io::Result<()> {
-    use sae_j1939_host::ecu::Ecu;
+    use sae_j1939_host::ecu::SocketCanEcu;
     use sae_j1939_host::sae_j1939_rs::diagnostics::{self, Dtc, Lamp, LampStatus, Lamps};
     use sae_j1939_host::sae_j1939_rs::request::Request;
     use sae_j1939_host::sae_j1939_rs::{name::industry_group, pgn, Address, Name};
@@ -37,9 +37,9 @@ fn main() -> std::io::Result<()> {
         .with_industry_group(industry_group::ON_HIGHWAY)
         .with_arbitrary_address_capable(true);
 
-    // The bus type is inferred as SocketCan; 1785-byte messages from up to
-    // eight peers at once.
-    let mut ecu = Ecu::<_, 1785, 8>::open(&interface, name, Address::new(0x80))?;
+    // `SocketCanEcu` is `Ecu<SocketCan, 1785, 8>` — a host-sized node on a
+    // Linux interface.
+    let mut ecu = SocketCanEcu::open(&interface, name, Address::new(0x80))?;
     println!(
         "claiming address {:#04x} on {interface}",
         ecu.address().as_u8()
