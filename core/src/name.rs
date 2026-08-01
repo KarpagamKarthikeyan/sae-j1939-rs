@@ -46,8 +46,47 @@
 /// Build one with [`Name::new`] and the `with_*` methods; every field is
 /// masked to its bit width, so an out-of-range value cannot corrupt its
 /// neighbours.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Name(u64);
+
+/// A compact summary: `NAME mfr=300 id=100 fn=0x87`.
+///
+/// Manufacturer and identity are what distinguish two otherwise identical ECUs,
+/// and function is what says what the device is — the three fields worth seeing
+/// in a log line.
+impl core::fmt::Display for Name {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "NAME mfr={} id={} fn={:#04X}",
+            self.manufacturer_code(),
+            self.identity_number(),
+            self.function()
+        )
+    }
+}
+
+/// Every field, because the packed `u64` is unreadable and the fields are
+/// exactly what you need when arbitration does something surprising.
+impl core::fmt::Debug for Name {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Name")
+            .field("raw", &format_args!("{:#018X}", self.0))
+            .field(
+                "arbitrary_address_capable",
+                &self.arbitrary_address_capable(),
+            )
+            .field("industry_group", &self.industry_group())
+            .field("vehicle_system_instance", &self.vehicle_system_instance())
+            .field("vehicle_system", &self.vehicle_system())
+            .field("function", &format_args!("{:#04X}", self.function()))
+            .field("function_instance", &self.function_instance())
+            .field("ecu_instance", &self.ecu_instance())
+            .field("manufacturer_code", &self.manufacturer_code())
+            .field("identity_number", &self.identity_number())
+            .finish()
+    }
+}
 
 macro_rules! name_field {
     (

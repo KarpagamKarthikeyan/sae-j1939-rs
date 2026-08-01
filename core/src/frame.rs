@@ -26,11 +26,31 @@ const FILL: u8 = 0xFF;
 /// assert_eq!(frame.source_address(), Address::new(0x80));
 /// assert_eq!(frame.data().len(), 8);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Frame {
     id: Id,
     data: [u8; MAX_PAYLOAD],
     len: u8,
+}
+
+/// Prints in the `candump` format every CAN engineer reads: `18FECA80#04002B`.
+///
+/// A frame logged by this crate can therefore be replayed with `cansend`
+/// verbatim, and traffic captured with `candump` compared against it by eye.
+impl core::fmt::Display for Frame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}#", self.id)?;
+        for byte in self.data() {
+            write!(f, "{byte:02X}")?;
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Debug for Frame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Frame({self})")
+    }
 }
 
 impl Frame {
@@ -135,6 +155,22 @@ mod tests {
         assert_eq!(frame.dlc(), 8);
         assert_eq!(frame.data(), &bytes);
         assert_eq!(Frame::new(id, &bytes).unwrap(), frame);
+    }
+
+    /// A logged frame must be replayable with `cansend` verbatim.
+    #[test]
+    fn frames_print_in_candump_format() {
+        extern crate std;
+        use std::format;
+
+        let id = Id::new(0x18FECA80).unwrap();
+        let frame = Frame::new(id, &[0x04, 0x00, 0x2B, 0x01, 0x04, 0x83]).unwrap();
+        assert_eq!(format!("{frame}"), "18FECA80#04002B010483");
+        assert_eq!(format!("{frame:?}"), "Frame(18FECA80#04002B010483)");
+
+        // The trailing 0xFF filler is not part of the frame, so it is not shown.
+        let short = Frame::new(id, &[0x01]).unwrap();
+        assert_eq!(format!("{short}"), "18FECA80#01");
     }
 
     #[test]

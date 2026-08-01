@@ -53,6 +53,7 @@ on a microcontroller with no allocator, as well as on a laptop.
 | **DM1 / DM2**: lamp status + trouble codes (SPN/FMI/occurrence) | -73 | ✅ |
 | **DM3**: clear previously active trouble codes | -73 | ✅ |
 | **`Node`**: one type doing claiming, filtering, reassembly, and dispatch | — | ✅ |
+| **`Outgoing`**: one type choosing single-frame vs BAM vs RTS/CTS on the way out | — | ✅ |
 | **`Ecu`**: `Node` on any `Bus` — clock, BAM pacing, RTS/CTS handshake | — | ✅ |
 | Pluggable transport (`Bus` trait): SocketCAN, an adapter SDK, or a simulator | — | ✅ |
 | `embedded-can` bridge + a frame-level Linux SocketCAN transport | — | ✅ |
@@ -210,10 +211,25 @@ if let Rx::Message { pgn, data, ack, .. } = rx.on_tp_dt(sender, &TpDt::new(2, &[
 }
 ```
 
-Sending works the same way. `Transmitter` drives either a BAM or the full
-RTS/CTS handshake, borrowing the payload so a 1785-byte message costs no extra
-RAM. (J1939-21 requires 50–200 ms between BAM packets; the type is sans-I/O and
-owns no clock, so that pacing is yours.)
+Sending is the mirror image. `Outgoing` makes the three decisions a sender has
+to — does this fit one frame, is it addressed or broadcast, and who drives the
+handshake — and just hands back frames:
+
+```rust
+use sae_j1939_rs::node::Outgoing;
+
+let mut tx = Outgoing::new(pgn::DM1, Address::new(0x80), Address::GLOBAL, &payload)?;
+while let Some(frame) = tx.next_frame() {
+    bus.send(frame)?;
+    // A BAM is unacknowledged, so J1939-21 paces it instead. `needs_pacing`
+    // is what tells you a 50-200 ms delay is required here.
+    if tx.needs_pacing() { delay_ms(50); }
+}
+```
+
+It borrows the payload, so a 1785-byte message costs no extra RAM. For an
+addressed transfer, feed the peer's replies to `tx.on_frame(..)` and it drives
+the RTS/CTS handshake for you.
 
 ### Claim an address, and defend it
 
@@ -372,6 +388,10 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
   ```
 
 ## Design
+
+For the full picture — layering against the J1939 parts, the PDU1/PDU2 split,
+receive and transmit data flows, transport-protocol sequence diagrams, and the
+address-claiming state machine — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 - **`core` (`sae-j1939-rs`)** — `no_std`, allocation-free, transport-agnostic.
   Identifier and PGN codecs, the transport protocol, NAME and address claiming,

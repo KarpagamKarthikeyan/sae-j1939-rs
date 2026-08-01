@@ -91,7 +91,25 @@ pub const T4_TIMEOUT_MS: u16 = 1050;
 /// assert_eq!(packet_count(14), 2);
 /// assert_eq!(packet_count(1785), 255);
 /// ```
+///
+/// Above [`MAX_MESSAGE_SIZE`] there is no answer to give — the protocol cannot
+/// carry the message at all — so the count saturates at 255 rather than wrapping
+/// to zero. Zero would be the one genuinely dangerous result: it reads as
+/// "no packets needed" and would send a caller's loop round zero times.
+///
+/// ```
+/// use sae_j1939_rs::tp::packet_count;
+/// assert_eq!(packet_count(1786), 255, "saturates rather than wrapping to 0");
+/// assert_eq!(packet_count(u16::MAX), 255);
+/// ```
+///
+/// Build messages through [`TpCm::bam`], [`TpCm::rts`], or
+/// [`Transmitter`] instead, all of which reject an out-of-range size outright.
 pub const fn packet_count(size: u16) -> u8 {
+    // `size / 7` reaches 256 at 1786 bytes, which truncates to 0 in a u8.
+    if size > MAX_MESSAGE_SIZE {
+        return u8::MAX;
+    }
     ((size as usize).div_ceil(BYTES_PER_PACKET)) as u8
 }
 
@@ -610,8 +628,15 @@ impl<const N: usize, const SESSIONS: usize> Reassembler<N, SESSIONS> {
                     pgn,
                 })
             }
-            TpCm::Abort { .. } => {
-                self.abandon(source);
+            TpCm::Abort { pgn, .. } => {
+                // The abort names the parameter group it abandons. A peer we
+                // are receiving from may also be *receiving* from us, and its
+                // abort of that other transfer must not tear down this one.
+                if let Some(index) = self.slot_of(source) {
+                    if self.slots[index].session.is_some_and(|s| s.pgn == pgn) {
+                        self.slots[index].session = None;
+                    }
+                }
                 Rx::Idle
             }
             // Sender-side messages; not ours to act on.
@@ -633,13 +658,21 @@ impl<const N: usize, const SESSIONS: usize> Reassembler<N, SESSIONS> {
 
         if dt.sequence != session.next_sequence {
             // Out of order. A BAM cannot be recovered, so drop it; an RTS/CTS
-            // session is aborted so the sender learns immediately.
+            // session is aborted so the sender learns immediately. J1939-21
+            // separates a packet we have already taken from one that skips
+            // ahead, because they point at different faults: a repeat means the
+            // sender missed our acknowledgement, a gap means a frame was lost.
             self.slots[index].session = None;
             return if session.broadcast {
                 Rx::Idle
             } else {
+                let reason = if dt.sequence < session.next_sequence {
+                    AbortReason::DuplicateSequenceNumber
+                } else {
+                    AbortReason::BadSequenceNumber
+                };
                 Rx::Send(TpCm::Abort {
-                    reason: AbortReason::BadSequenceNumber,
+                    reason,
                     pgn: session.pgn,
                 })
             };
@@ -937,7 +970,16 @@ impl<'a> Transmitter<'a> {
     }
 
     /// Handle a TP.CM from the receiver.
+    ///
+    /// Every TP.CM names the parameter group it belongs to, and only the one
+    /// this transmitter is sending is acted on. That matters whenever two ECUs
+    /// have transfers open in both directions at once: the peer is then both our
+    /// receiver *and* a sender, and its connection management for that other
+    /// transfer must not grant, complete, or abort this one.
     pub fn on_tp_cm(&mut self, cm: &TpCm) -> Tx {
+        if cm.pgn() != self.pgn {
+            return Tx::Idle;
+        }
         match *cm {
             TpCm::Cts {
                 packets,
@@ -1090,6 +1132,19 @@ mod tests {
         assert_eq!(packet_count(14), 2);
         assert_eq!(packet_count(15), 3);
         assert_eq!(packet_count(MAX_MESSAGE_SIZE), 255);
+    }
+
+    /// A `u8` count wraps to zero at 1786 bytes, and zero is the one answer that
+    /// is actively dangerous: it reads as "no packets needed".
+    #[test]
+    fn packet_count_saturates_instead_of_wrapping_to_zero() {
+        for size in [MAX_MESSAGE_SIZE + 1, 2000, 10_000, u16::MAX] {
+            assert_eq!(packet_count(size), u8::MAX, "size {size} must not wrap");
+        }
+        // The announcement helpers refuse such a size outright, which is the
+        // path callers should actually be on.
+        assert!(TpCm::bam(MAX_MESSAGE_SIZE + 1, pgn::DM1).is_err());
+        assert!(TpCm::rts(MAX_MESSAGE_SIZE + 1, pgn::DM1).is_err());
     }
 
     /// Split a payload into the packets a real sender would put on the bus.
@@ -1425,6 +1480,114 @@ mod tests {
         assert_eq!(expired, [alice], "only the stalled session expires");
         assert!(rx.is_receiving_from(bob));
         assert_eq!(rx.active_sessions(), 1);
+    }
+
+    /// Two ECUs often have transfers open in both directions at once. A peer
+    /// aborting the transfer *it* is sending must not tear down the one we are
+    /// receiving from it.
+    #[test]
+    fn an_abort_for_another_parameter_group_leaves_our_session_alone() {
+        let mut rx = Reassembler::<256>::new();
+        rx.on_tp_cm(SENDER, &TpCm::rts(21, pgn::DM1).unwrap());
+        assert!(rx.is_busy());
+
+        // The same peer aborts a different transfer.
+        rx.on_tp_cm(
+            SENDER,
+            &TpCm::Abort {
+                reason: AbortReason::Timeout,
+                pgn: pgn::DM2,
+            },
+        );
+        assert!(
+            rx.is_receiving_from(SENDER),
+            "an abort naming another PGN must not end this transfer"
+        );
+
+        // An abort naming ours does end it.
+        rx.on_tp_cm(
+            SENDER,
+            &TpCm::Abort {
+                reason: AbortReason::Timeout,
+                pgn: pgn::DM1,
+            },
+        );
+        assert!(!rx.is_busy());
+    }
+
+    /// J1939-21 gives a repeated packet and a skipped one different abort
+    /// reasons, because they point at different faults: a repeat means the
+    /// sender missed our acknowledgement, a gap means a frame was lost.
+    #[test]
+    fn a_repeated_packet_and_a_gap_abort_for_different_reasons() {
+        let expect_reason = |bad_sequence: u8, expected: AbortReason| {
+            let mut rx = Reassembler::<256>::new();
+            rx.on_tp_cm(SENDER, &TpCm::rts(28, pgn::DM1).unwrap());
+            rx.on_tp_dt(SENDER, &TpDt::new(1, &[0; 7]));
+            rx.on_tp_dt(SENDER, &TpDt::new(2, &[0; 7]));
+            // Now expecting 3.
+            match rx.on_tp_dt(SENDER, &TpDt::new(bad_sequence, &[0; 7])) {
+                Rx::Send(TpCm::Abort { reason, .. }) => assert_eq!(
+                    reason, expected,
+                    "sequence {bad_sequence} where 3 was expected"
+                ),
+                other => panic!("expected an abort, got {other:?}"),
+            }
+        };
+
+        expect_reason(2, AbortReason::DuplicateSequenceNumber);
+        expect_reason(4, AbortReason::BadSequenceNumber);
+    }
+
+    /// The transmitter's peer may also be sending to us. Its connection
+    /// management for that other transfer must not grant, complete, or abort
+    /// ours.
+    #[test]
+    fn a_transmitter_ignores_connection_management_for_another_group() {
+        let mut tx = Transmitter::addressed(pgn::DM1, &[0; 21]).unwrap();
+        tx.start();
+
+        // A CTS for a different parameter group must not open our window.
+        assert_eq!(
+            tx.on_tp_cm(&TpCm::Cts {
+                packets: 3,
+                next_packet: 1,
+                pgn: pgn::DM2,
+            }),
+            Tx::Idle
+        );
+        assert!(tx.next_packet().is_none(), "the window must stay shut");
+
+        // Nor may an acknowledgement for another group complete us...
+        assert_eq!(
+            tx.on_tp_cm(&TpCm::EndOfMsgAck {
+                size: 21,
+                packets: 3,
+                pgn: pgn::DM2,
+            }),
+            Tx::Idle
+        );
+        assert!(!tx.is_complete());
+
+        // ...nor an abort for another group tear us down.
+        assert_eq!(
+            tx.on_tp_cm(&TpCm::Abort {
+                reason: AbortReason::Timeout,
+                pgn: pgn::DM2,
+            }),
+            Tx::Idle
+        );
+
+        // Our own CTS still works.
+        assert_eq!(
+            tx.on_tp_cm(&TpCm::Cts {
+                packets: 3,
+                next_packet: 1,
+                pgn: pgn::DM1,
+            }),
+            Tx::SendData
+        );
+        assert!(tx.next_packet().is_some());
     }
 
     #[test]

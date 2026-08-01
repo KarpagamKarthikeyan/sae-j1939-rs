@@ -61,11 +61,9 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use sae_j1939_rs::address_claim::ClaimState;
-use sae_j1939_rs::frame::{Frame, MAX_PAYLOAD};
-use sae_j1939_rs::node::{Event, Node};
+use sae_j1939_rs::frame::Frame;
+use sae_j1939_rs::node::{Event, Node, Outgoing, Progress};
 use sae_j1939_rs::request::Request;
-use sae_j1939_rs::tp::{TpCm, TpDt};
-use sae_j1939_rs::tp::{Transmitter, Tx};
 use sae_j1939_rs::{pgn, Address, Id, Name, Pgn, Priority};
 
 use crate::bus::{Bus, Message};
@@ -254,18 +252,19 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
     /// the bus. Call [`Ecu::claim_address`] and check [`Ecu::has_address`].
     pub fn broadcast(&mut self, group: Pgn, data: &[u8]) -> io::Result<()> {
         self.check_may_transmit()?;
-        let source = self.address();
-        if data.len() <= MAX_PAYLOAD {
-            let id = Id::broadcast(Priority::DEFAULT, group, source);
-            let frame = Frame::new(id, data).map_err(invalid_input)?;
-            return self.bus.send_frame(&frame);
-        }
+        let mut outgoing =
+            Outgoing::new(group, self.address(), Address::GLOBAL, data).map_err(invalid_input)?;
+        let paced = outgoing.needs_pacing();
 
-        let mut tx = Transmitter::broadcast(group, data).map_err(invalid_input)?;
-        self.send_tp_cm(source, Address::GLOBAL, &tx.start())?;
-        while let Some(packet) = tx.next_packet() {
-            std::thread::sleep(BAM_PACKET_INTERVAL);
-            self.send_tp_dt(source, Address::GLOBAL, &packet)?;
+        let mut first = true;
+        while let Some(frame) = outgoing.next_frame() {
+            // A BAM is not acknowledged, so J1939-21 spaces its packets instead.
+            // The announcement goes out immediately; the data packets do not.
+            if paced && !first {
+                std::thread::sleep(BAM_PACKET_INTERVAL);
+            }
+            first = false;
+            self.bus.send_frame(&frame)?;
         }
         Ok(())
     }
@@ -281,21 +280,27 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
     ///
     /// Returns [`io::ErrorKind::NotConnected`] if this ECU has not claimed an
     /// address — see [`Ecu::broadcast`].
+    ///
+    /// Passing [`Address::GLOBAL`] defers to [`Ecu::broadcast`]. There is no
+    /// handshake to run with everybody at once, and a long message sent that way
+    /// is a BAM, which has to be paced — blasting it here would put traffic on
+    /// the bus that conforming receivers drop.
     pub fn send_to(&mut self, destination: Address, group: Pgn, data: &[u8]) -> io::Result<()> {
+        if destination.is_broadcast() {
+            return self.broadcast(group, data);
+        }
         self.check_may_transmit()?;
-        let source = self.address();
-        if data.len() <= MAX_PAYLOAD {
-            let id = Id::from_parts(Priority::DEFAULT, group, destination, source)
-                .map_err(invalid_input)?;
-            let frame = Frame::new(id, data).map_err(invalid_input)?;
-            return self.bus.send_frame(&frame);
+        let mut outgoing =
+            Outgoing::new(group, self.address(), destination, data).map_err(invalid_input)?;
+
+        // Everything available right now: the whole message if it is short, or
+        // the announcement if it is not.
+        while let Some(frame) = outgoing.next_frame() {
+            self.bus.send_frame(&frame)?;
         }
 
-        let mut tx = Transmitter::addressed(group, data).map_err(invalid_input)?;
-        self.send_tp_cm(source, destination, &tx.start())?;
-
         let mut deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-        while !tx.is_complete() {
+        while !outgoing.is_complete() {
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -310,34 +315,27 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
                 continue;
             };
 
-            // A connection-management frame from our peer drives this transfer;
-            // anything else is ordinary traffic and goes to the node.
-            let is_peer_cm = frame.pgn() == pgn::TP_CM && frame.source_address() == destination;
-            if !is_peer_cm {
-                if let Some(message) = self.dispatch(&frame)? {
-                    self.pending.push_back(message);
-                }
-                continue;
-            }
-
-            let Ok(cm) = TpCm::decode(frame.payload()) else {
-                continue;
-            };
-            match tx.on_tp_cm(&cm) {
-                Tx::SendData => {
-                    while let Some(packet) = tx.next_packet() {
-                        self.send_tp_dt(source, destination, &packet)?;
+            match outgoing.on_frame(&frame) {
+                Progress::Ready => {
+                    while let Some(packet) = outgoing.next_frame() {
+                        self.bus.send_frame(&packet)?;
                     }
                     deadline = Instant::now() + HANDSHAKE_TIMEOUT;
                 }
-                Tx::Complete => break,
-                Tx::Aborted(reason) => {
+                Progress::Complete => break,
+                Progress::Aborted(reason) => {
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         format!("peer aborted the transfer: {reason:?}"),
                     ))
                 }
-                Tx::Idle => {}
+                // Not part of this transfer: ordinary traffic, handled normally
+                // and queued rather than dropped.
+                Progress::Idle => {
+                    if let Some(message) = self.dispatch(&frame)? {
+                        self.pending.push_back(message);
+                    }
+                }
             }
         }
         Ok(())
@@ -357,21 +355,6 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
                 _ => "no address claimed yet — call claim_address() first",
             },
         ))
-    }
-
-    /// A transport-protocol connection-management frame. TP traffic is priority
-    /// 7, the lowest, so bulk transfers yield to control traffic.
-    fn send_tp_cm(&self, source: Address, destination: Address, cm: &TpCm) -> io::Result<()> {
-        let id = Id::from_parts(Priority::LOWEST, pgn::TP_CM, destination, source)
-            .map_err(invalid_input)?;
-        self.bus.send_frame(&Frame::from_payload(id, cm.encode()))
-    }
-
-    /// A transport-protocol data packet.
-    fn send_tp_dt(&self, source: Address, destination: Address, dt: &TpDt) -> io::Result<()> {
-        let id = Id::from_parts(Priority::LOWEST, pgn::TP_DT, destination, source)
-            .map_err(invalid_input)?;
-        self.bus.send_frame(&Frame::from_payload(id, dt.encode()))
     }
 
     /// Read one frame, dispatch it, and advance the node's timers.
@@ -449,10 +432,12 @@ fn invalid_input<E: ToString>(error: E) -> io::Error {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::sync::{Arc, Mutex};
 
     use sae_j1939_rs::address_claim::ClaimState;
     use sae_j1939_rs::diagnostics::{self, Dtc, Lamp, LampStatus, Lamps};
-    use sae_j1939_rs::tp::Transmitter;
+    use sae_j1939_rs::identification::{self, EcuIdentification};
+    use sae_j1939_rs::tp::{AbortReason, TpCm, TpDt, Transmitter};
     use sae_j1939_rs::Name;
 
     /// A bus that replays a scripted sequence and records what was sent.
@@ -773,5 +758,367 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         // The RTS did go out before giving up.
         assert_eq!(ecu.bus().sent_with_pgn(pgn::TP_CM).len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Scripted exchanges: one ECU, a bus that answers it
+    // -----------------------------------------------------------------------
+
+    /// A frame from `source` to `destination` carrying connection management.
+    fn cm_frame(source: Address, destination: Address, cm: &TpCm) -> Frame {
+        Frame::from_payload(
+            Id::from_parts(Priority::LOWEST, pgn::TP_CM, destination, source).unwrap(),
+            cm.encode(),
+        )
+    }
+
+    /// A frame from `source` to `destination` carrying a data packet.
+    fn dt_frame(source: Address, destination: Address, dt: &TpDt) -> Frame {
+        Frame::from_payload(
+            Id::from_parts(Priority::LOWEST, pgn::TP_DT, destination, source).unwrap(),
+            dt.encode(),
+        )
+    }
+
+    /// An ECU pushing a multi-packet message to a peer that is pushing one back
+    /// at the same time — both transfers live on the same `send_to` call.
+    ///
+    /// This is where a host stack loses messages: it is blocked driving its own
+    /// handshake, and everything arriving meanwhile looks like an interruption.
+    /// The inbound transfer has to be answered with a CTS *and* an
+    /// acknowledgement while the outbound one is still in flight, and the
+    /// reassembled result has to survive until the caller asks for it.
+    #[test]
+    fn an_ecu_sends_and_receives_multi_packet_messages_in_one_exchange() {
+        let us = Address::new(0x80);
+        let peer = Address::new(0x90);
+        let inbound: Vec<u8> = (0..21).map(|i| (i * 7) as u8).collect();
+
+        let mut ecu = ecu_on(FakeBus::default(), name_for(1, 300));
+        ecu.claim_address().unwrap();
+
+        // Script the peer's side of the exchange. It is queued after the claim
+        // so that the contention window does not consume it first.
+        //
+        // The peer opens its own transfer before answering ours...
+        ecu.bus().queue(cm_frame(
+            peer,
+            us,
+            &TpCm::rts(21, pgn::ECU_IDENTIFICATION).unwrap(),
+        ));
+        // ...then grants our window...
+        ecu.bus().queue(cm_frame(
+            peer,
+            us,
+            &TpCm::Cts {
+                packets: 3,
+                next_packet: 1,
+                pgn: pgn::DM1,
+            },
+        ));
+        // ...then sends its own packets, interleaved with ours going out...
+        for (i, chunk) in inbound.chunks(7).enumerate() {
+            ecu.bus()
+                .queue(dt_frame(peer, us, &TpDt::new(i as u8 + 1, chunk)));
+        }
+        // ...and finally acknowledges ours.
+        ecu.bus().queue(cm_frame(
+            peer,
+            us,
+            &TpCm::EndOfMsgAck {
+                size: 21,
+                packets: 3,
+                pgn: pgn::DM1,
+            },
+        ));
+
+        ecu.send_to(peer, pgn::DM1, &[0xAB; 21])
+            .expect("the outbound transfer must complete");
+
+        // Our side: an RTS and three data packets went out.
+        assert_eq!(
+            ecu.bus().sent_with_pgn(pgn::TP_DT).len(),
+            3,
+            "every packet of the outbound message must be sent"
+        );
+
+        // Their side: we answered with a CTS and an end-of-message
+        // acknowledgement without ever leaving `send_to`.
+        let ours: Vec<TpCm> = ecu
+            .bus()
+            .sent_with_pgn(pgn::TP_CM)
+            .iter()
+            .map(|f| TpCm::decode(f.payload()).unwrap())
+            .collect();
+        assert!(
+            ours.iter().any(|cm| matches!(
+                cm,
+                TpCm::Cts { pgn, .. } if *pgn == pgn::ECU_IDENTIFICATION
+            )),
+            "the peer's RTS must be answered even while we are mid-send, got {ours:?}"
+        );
+        assert!(
+            ours.iter().any(|cm| matches!(
+                cm,
+                TpCm::EndOfMsgAck { pgn, .. } if *pgn == pgn::ECU_IDENTIFICATION
+            )),
+            "the peer's transfer must be acknowledged, got {ours:?}"
+        );
+
+        // And the message itself was kept, not dropped for being inconvenient.
+        let delivered = ecu
+            .poll()
+            .unwrap()
+            .expect("a message that arrived during the handshake must survive it");
+        assert_eq!(delivered.pgn, pgn::ECU_IDENTIFICATION);
+        assert_eq!(delivered.source, peer);
+        assert_eq!(delivered.data, inbound);
+    }
+
+    /// Regression: the peer aborts a transfer of its own while ours is in
+    /// flight. The abort names a different parameter group, so it is not ours,
+    /// and our send must run to completion.
+    #[test]
+    fn a_peers_abort_of_another_group_does_not_fail_our_send() {
+        let us = Address::new(0x80);
+        let peer = Address::new(0x90);
+
+        let mut ecu = ecu_on(FakeBus::default(), name_for(1, 300));
+        ecu.claim_address().unwrap();
+
+        ecu.bus().queue(cm_frame(
+            peer,
+            us,
+            &TpCm::Abort {
+                reason: AbortReason::ResourcesUnavailable,
+                pgn: pgn::ECU_IDENTIFICATION,
+            },
+        ));
+        ecu.bus().queue(cm_frame(
+            peer,
+            us,
+            &TpCm::Cts {
+                packets: 3,
+                next_packet: 1,
+                pgn: pgn::DM1,
+            },
+        ));
+        ecu.bus().queue(cm_frame(
+            peer,
+            us,
+            &TpCm::EndOfMsgAck {
+                size: 21,
+                packets: 3,
+                pgn: pgn::DM1,
+            },
+        ));
+
+        ecu.send_to(peer, pgn::DM1, &[0u8; 21])
+            .expect("an abort naming another group must not fail our transfer");
+        assert_eq!(ecu.bus().sent_with_pgn(pgn::TP_DT).len(), 3);
+    }
+
+    /// An abort that *does* name our parameter group ends the transfer, and says
+    /// why. The two tests are only meaningful as a pair.
+    #[test]
+    fn a_peers_abort_of_our_own_group_fails_the_send() {
+        let us = Address::new(0x80);
+        let peer = Address::new(0x90);
+
+        let mut ecu = ecu_on(FakeBus::default(), name_for(1, 300));
+        ecu.claim_address().unwrap();
+
+        ecu.bus().queue(cm_frame(
+            peer,
+            us,
+            &TpCm::Abort {
+                reason: AbortReason::ResourcesUnavailable,
+                pgn: pgn::DM1,
+            },
+        ));
+
+        let error = ecu.send_to(peer, pgn::DM1, &[0u8; 21]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(
+            error.to_string().contains("ResourcesUnavailable"),
+            "the reason belongs in the error, got: {error}"
+        );
+        assert!(
+            ecu.bus().sent_with_pgn(pgn::TP_DT).is_empty(),
+            "nothing may go out after an abort"
+        );
+    }
+
+    /// Regression: `send_to(GLOBAL, ..)` is a broadcast, not a handshake.
+    ///
+    /// There is nobody to hand a message to "specifically" at the global
+    /// address, so a long one is a BAM — and a BAM has no flow control, only
+    /// pacing. Blasting the packets back to back would put traffic on the bus
+    /// that conforming receivers drop, and waiting for a CTS that cannot come
+    /// would fail the call outright.
+    #[test]
+    fn a_long_message_sent_to_the_global_address_is_paced_like_a_bam() {
+        let mut ecu = ecu_on(FakeBus::default(), name_for(1, 300));
+        ecu.claim_address().unwrap();
+
+        let started = Instant::now();
+        ecu.send_to(Address::GLOBAL, pgn::DM1, &[0u8; 14])
+            .expect("a broadcast needs no acknowledgement, so it cannot time out");
+        let elapsed = started.elapsed();
+
+        let announcements = ecu.bus().sent_with_pgn(pgn::TP_CM);
+        assert_eq!(announcements.len(), 1);
+        assert!(
+            matches!(
+                TpCm::decode(announcements[0].payload()).unwrap(),
+                TpCm::Bam { size: 14, .. }
+            ),
+            "the global address must be announced with a BAM, not an RTS"
+        );
+        assert_eq!(ecu.bus().sent_with_pgn(pgn::TP_DT).len(), 2);
+        assert!(
+            elapsed >= BAM_PACKET_INTERVAL,
+            "the two data packets must be spaced, but went out in {elapsed:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Two real ECUs, one bus
+    // -----------------------------------------------------------------------
+
+    /// A two-ended in-memory bus, so two `Ecu`s can hold an actual conversation.
+    ///
+    /// Each end reads only what the other wrote: a CAN controller does not
+    /// receive its own frames, and an ECU that heard its own address claim would
+    /// contend with itself.
+    #[derive(Debug, Default)]
+    struct Link {
+        to_a: Mutex<VecDeque<Frame>>,
+        to_b: Mutex<VecDeque<Frame>>,
+    }
+
+    #[derive(Debug)]
+    struct End {
+        link: Arc<Link>,
+        a_side: bool,
+    }
+
+    impl Bus for End {
+        fn send_frame(&self, frame: &Frame) -> io::Result<()> {
+            let queue = if self.a_side {
+                &self.link.to_b
+            } else {
+                &self.link.to_a
+            };
+            queue.lock().unwrap().push_back(*frame);
+            Ok(())
+        }
+
+        fn recv_frame(&self) -> io::Result<Option<Frame>> {
+            let queue = if self.a_side {
+                &self.link.to_a
+            } else {
+                &self.link.to_b
+            };
+            let frame = queue.lock().unwrap().pop_front();
+            if frame.is_none() {
+                // `Bus` asks implementations to block briefly rather than return
+                // immediately; with two ECUs polling in one process, the
+                // difference is a test versus a space heater.
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(frame)
+        }
+    }
+
+    fn link_ends() -> (End, End) {
+        let link = Arc::new(Link::default());
+        (
+            End {
+                link: Arc::clone(&link),
+                a_side: true,
+            },
+            End {
+                link,
+                a_side: false,
+            },
+        )
+    }
+
+    /// The exchange a diagnostic tool performs on every bus it is plugged into:
+    /// claim an address, ask an ECU who it is, and read the answer — which is
+    /// far too long for one frame and comes back over the transport protocol.
+    ///
+    /// Both ends are real `Ecu`s driving real sockets' worth of frames at each
+    /// other, so this covers the parts the scripted tests cannot: two address
+    /// claims racing, and a handshake where both sides are genuinely blocking on
+    /// the other.
+    #[test]
+    fn two_ecus_complete_a_request_and_a_multi_packet_response() {
+        const FIELDS: &[&[u8]] = &[b"PN-1234", b"SN-99", b"ENGINE BAY", b"ECM", b"ACME MOTORS"];
+        let tool_address = Address::new(0x80);
+        let ecu_address = Address::new(0x90);
+        let patience = Duration::from_secs(10);
+
+        let (tool_end, ecu_end) = link_ends();
+
+        // The ECU under test: come up, answer one request, and stop.
+        let responder = std::thread::spawn(move || -> io::Result<()> {
+            let mut ecu = Ecu::<_, 1785, 4>::new(ecu_end, name_for(2, 200), ecu_address);
+            ecu.claim_address()?;
+            assert!(ecu.has_address(), "the responder never claimed an address");
+
+            let deadline = Instant::now() + patience;
+            while Instant::now() < deadline {
+                let Some(message) = ecu.poll()? else { continue };
+                if message.pgn != pgn::REQUEST {
+                    continue;
+                }
+                let Ok(request) = Request::decode(&message.data) else {
+                    continue;
+                };
+                if request.pgn != pgn::ECU_IDENTIFICATION {
+                    continue;
+                }
+
+                let mut payload = [0u8; 128];
+                let len = identification::encode(FIELDS, &mut payload).unwrap();
+                assert!(len > 8, "identification must not fit a single frame");
+                ecu.send_to(message.source, pgn::ECU_IDENTIFICATION, &payload[..len])?;
+                return Ok(());
+            }
+            panic!("the responder never saw the request");
+        });
+
+        let mut tool = Ecu::<_, 1785, 4>::new(tool_end, name_for(1, 100), tool_address);
+        tool.claim_address().unwrap();
+        assert!(tool.has_address(), "the tool never claimed an address");
+        assert_eq!(tool.address(), tool_address, "nobody contested 0x80");
+
+        tool.request(ecu_address, pgn::ECU_IDENTIFICATION).unwrap();
+
+        let deadline = Instant::now() + patience;
+        let mut answer = None;
+        while Instant::now() < deadline {
+            if let Some(message) = tool.poll().unwrap() {
+                if message.pgn == pgn::ECU_IDENTIFICATION {
+                    answer = Some(message);
+                    break;
+                }
+            }
+        }
+
+        responder
+            .join()
+            .expect("the responder thread panicked")
+            .expect("the responder hit an I/O error");
+
+        let answer = answer.expect("the tool never received the identification");
+        assert_eq!(answer.source, ecu_address);
+        let identification = EcuIdentification::new(&answer.data);
+        assert_eq!(identification.field_count(), 5);
+        assert_eq!(identification.part_number_str(), Some("PN-1234"));
+        assert_eq!(identification.serial_number_str(), Some("SN-99"));
+        assert_eq!(identification.manufacturer_name_str(), Some("ACME MOTORS"));
     }
 }

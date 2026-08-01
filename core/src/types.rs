@@ -99,8 +99,32 @@ impl std::error::Error for Error {}
 /// assert!(Address::GLOBAL.is_broadcast());
 /// assert!(!Address::NULL.is_specific());
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Address(u8);
+
+/// Prints as hex, naming the two reserved values: `0x80`, `0xFF (global)`,
+/// `0xFE (null)`.
+impl fmt::Display for Address {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:#04X}", self.0)?;
+        match self.0 {
+            0xFF => f.write_str(" (global)"),
+            0xFE => f.write_str(" (null)"),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl fmt::Debug for Address {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Address({:#04X}", self.0)?;
+        match self.0 {
+            0xFF => f.write_str(" global)"),
+            0xFE => f.write_str(" null)"),
+            _ => f.write_str(")"),
+        }
+    }
+}
 
 impl Address {
     /// The null address (`0xFE`), used when an ECU cannot claim an address.
@@ -160,8 +184,20 @@ impl From<Address> for u8 {
 /// assert_eq!(Priority::DEFAULT.as_u8(), 6);
 /// assert!(Priority::new(8).is_err());
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Priority(u8);
+
+impl fmt::Display for Priority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Debug for Priority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Priority({})", self.0)
+    }
+}
 
 impl Priority {
     /// The highest priority (`0`).
@@ -224,6 +260,18 @@ mod tests {
         assert!(!Address::NULL.is_broadcast());
         assert!(Address::GLOBAL.is_broadcast());
         assert!(!Address::GLOBAL.is_specific());
+    }
+
+    #[test]
+    fn addresses_print_in_hex_and_name_the_reserved_values() {
+        extern crate std;
+        use std::format;
+
+        assert_eq!(format!("{}", Address::new(0x80)), "0x80");
+        assert_eq!(format!("{}", Address::GLOBAL), "0xFF (global)");
+        assert_eq!(format!("{}", Address::NULL), "0xFE (null)");
+        assert_eq!(format!("{:?}", Address::new(0x80)), "Address(0x80)");
+        assert_eq!(format!("{:?}", Address::GLOBAL), "Address(0xFF global)");
     }
 
     #[test]

@@ -205,7 +205,7 @@ const fn set_field(byte: u8, shift: u8, bits: u8) -> u8 {
 /// byte 2   SPN bits 18..16 (top 3 bits) | FMI (low 5 bits)
 /// byte 3   SPN conversion method (top bit) | occurrence count (low 7 bits)
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct Dtc {
     /// Suspect Parameter Number: which parameter is at fault (19 bits).
     pub spn: u32,
@@ -217,6 +217,30 @@ pub struct Dtc {
     /// The SPN conversion method. `false` selects one of the three legacy
     /// alignments, `true` the current one.
     pub conversion_method: bool,
+}
+
+/// Prints the way a service tool reads a fault: `SPN 100 FMI 1 (x2)`.
+impl core::fmt::Display for Dtc {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.is_no_fault() {
+            return f.write_str("no active fault");
+        }
+        write!(
+            f,
+            "SPN {} FMI {} (x{})",
+            self.spn, self.fmi, self.occurrence_count
+        )
+    }
+}
+
+impl core::fmt::Debug for Dtc {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Dtc({self}")?;
+        if !self.conversion_method {
+            f.write_str(", legacy conversion")?;
+        }
+        f.write_str(")")
+    }
 }
 
 impl Dtc {
@@ -530,6 +554,28 @@ mod tests {
             assert_eq!(decoded.fmi, fmi);
             assert_eq!(decoded.occurrence_count, count);
         }
+    }
+
+    #[test]
+    fn trouble_codes_print_the_way_a_service_tool_reads_them() {
+        extern crate std;
+        use std::format;
+
+        let dtc = Dtc::new(100, 1, 2).unwrap();
+        assert_eq!(format!("{dtc}"), "SPN 100 FMI 1 (x2)");
+        assert_eq!(format!("{dtc:?}"), "Dtc(SPN 100 FMI 1 (x2))");
+
+        // The placeholder an ECU sends when it has nothing to report.
+        assert_eq!(format!("{}", Dtc::default()), "no active fault");
+
+        let legacy = Dtc {
+            conversion_method: false,
+            ..dtc
+        };
+        assert_eq!(
+            format!("{legacy:?}"),
+            "Dtc(SPN 100 FMI 1 (x2), legacy conversion)"
+        );
     }
 
     #[test]

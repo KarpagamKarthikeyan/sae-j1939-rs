@@ -51,8 +51,21 @@ pub const PDU2_FORMAT_MIN: u8 = 0xF0;
 /// group the PDU-specific byte is cleared, because it carries the destination
 /// address rather than part of the group's identity. Build one from a raw value
 /// with [`Pgn::new`], or use the constants in [`crate::pgn`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Pgn(u32);
+
+/// Prints both forms, because J1939 documentation uses both: `0x00FECA (65226)`.
+impl core::fmt::Display for Pgn {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:#08X} ({})", self.0, self.0)
+    }
+}
+
+impl core::fmt::Debug for Pgn {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Pgn({:#08X})", self.0)
+    }
+}
 
 impl Pgn {
     /// Build a PGN from a raw 18-bit value.

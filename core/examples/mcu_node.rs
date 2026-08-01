@@ -33,9 +33,8 @@ use embedded_can::Id as CanId;
 
 use sae_j1939_rs::can::{decode, encode};
 use sae_j1939_rs::diagnostics::{self, Dtc, Lamp, LampStatus, Lamps};
-use sae_j1939_rs::node::{Event, Node, ADDRESS_CLAIM_WINDOW_MS};
+use sae_j1939_rs::node::{Event, Node, Outgoing, ADDRESS_CLAIM_WINDOW_MS};
 use sae_j1939_rs::request::Request;
-use sae_j1939_rs::tp::Transmitter;
 use sae_j1939_rs::{name::industry_group, pgn, Address, Frame, Name};
 
 /// How much memory this ECU gives to reassembling one incoming message.
@@ -144,22 +143,29 @@ fn main() {
     println!("\n{} frames transmitted", can.sent.borrow().len());
 }
 
-/// Split a message across the transport protocol and broadcast it.
+/// Broadcast a message, however many frames that takes.
 ///
-/// On hardware, space these packets 50–200 ms apart with a timer — sending them
-/// back to back will lose the transfer on a busy bus.
+/// `Outgoing` decides whether this fits one frame or needs the transport
+/// protocol, and hands back frames either way — the caller never builds a TP.CM
+/// or a TP.DT by hand.
 fn broadcast_dm1(can: &MockCan, source: Address, payload: &[u8]) {
-    use sae_j1939_rs::{Id, Priority};
+    let mut tx =
+        Outgoing::new(pgn::DM1, source, Address::GLOBAL, payload).expect("a valid message size");
 
-    let mut tx = Transmitter::broadcast(pgn::DM1, payload).expect("9..=1785 bytes");
-    let cm_id = Id::broadcast(Priority::LOWEST, pgn::TP_CM, source);
-    transmit(can, &Frame::from_payload(cm_id, tx.start().encode()));
+    println!(
+        "  tx DM1 with 3 trouble codes in {} frames{}",
+        tx.frame_count(),
+        if tx.needs_pacing() { " (paced)" } else { "" }
+    );
 
-    let dt_id = Id::broadcast(Priority::LOWEST, pgn::TP_DT, source);
-    while let Some(packet) = tx.next_packet() {
-        transmit(can, &Frame::from_payload(dt_id, packet.encode()));
+    while let Some(frame) = tx.next_frame() {
+        transmit(can, &frame);
+        // A BAM is not acknowledged, so J1939-21 paces it instead: wait 50-200 ms
+        // here on hardware. `needs_pacing` is what tells you it is required.
+        if tx.needs_pacing() {
+            // delay_ms(50);
+        }
     }
-    println!("  tx DM1 with 3 trouble codes over a BAM");
 }
 
 /// Build a Request frame, as another ECU on the bus would send it.

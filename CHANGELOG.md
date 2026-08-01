@@ -95,8 +95,26 @@ parameter groups, the ISO 11783 valve groups, and a SocketCAN transport.
     CTS/acknowledgement handshakes. `on_frame` returns what to transmit and what
     arrived; `tick` closes the 250 ms contention window and expires stalled
     transfers. Still sans-I/O — it owns no bus and no clock.
+  - `node::Outgoing` — the transmit counterpart to `Node`. Decides between a
+    single frame, a BAM, and an RTS/CTS handshake, and yields frames; the caller
+    never builds a TP.CM or TP.DT by hand. `needs_pacing` reports when J1939-21's
+    50–200 ms BAM spacing applies. Borrows the payload, so a 1785-byte message
+    costs no extra RAM.
   - `Frame::from_payload` — infallible constructor for the common case of a full
     eight-byte parameter group.
+
+  *Formatting*
+  - `Display` and a domain-appropriate `Debug` on the wire-shaped types, because
+    the derived ones were unreadable — a CAN identifier is not a decimal number
+    and a packed NAME is not a `u64`:
+    - `Frame` prints in `candump` format (`18FECA80#04002B`), so a logged frame
+      replays with `cansend` verbatim and compares against a capture by eye.
+    - `Id` prints as the eight hex digits every tool shows; its `Debug` also
+      decodes priority, PGN, source, and destination.
+    - `Pgn` prints both hex and decimal, since J1939 documentation uses both.
+    - `Address` names the two reserved values (`0xFF (global)`, `0xFE (null)`).
+    - `Name`'s `Debug` shows all nine fields rather than the packed integer.
+    - `Dtc` prints the way a service tool reads a fault: `SPN 100 FMI 1 (x2)`.
 
   *Transport-agnostic plumbing*
   - `can` — bridge to the `embedded-can` traits (`frame_from`, `j1939_id`,
@@ -140,12 +158,50 @@ parameter groups, the ISO 11783 valve groups, and a SocketCAN transport.
   and a counter standing in for `SysTick`. It runs on a host so the logic can be
   watched without hardware.
 
+- **Documentation** — `ARCHITECTURE.md`: the system in 16 diagrams, covering the
+  crate split, the layering against J1939-21/-71/-73/-81 and ISO 11783, the
+  29-bit identifier and its PDU1/PDU2 trap, receive and transmit data flows,
+  BAM and RTS/CTS sequences with their abort paths, the address-claiming state
+  machine, the reassembler session model, and the memory and sans-I/O rationale.
+
+### Fixed during pre-release validation
+
+Eight defects, each now covered by a test that fails without the fix. Five share
+a root cause worth naming: **two ECUs frequently have transfers open in both
+directions at once**, and the code assumed any connection-management frame from a
+peer belonged to the transfer in hand.
+
+- `Reassembler` tore down a receive session on an abort naming a *different*
+  parameter group — that is, the peer aborting the transfer it was sending.
+- `Transmitter::on_tp_cm` let a peer's CTS, acknowledgement, or abort for another
+  parameter group grant, complete, or tear down an unrelated transfer.
+- `Node` answered a *globally addressed* RTS with a CTS. An RTS is
+  destination-specific by definition; one malformed frame would have made every
+  ECU on the bus emit a CTS at once and hold a session slot until `T1`.
+- `Ecu::send_to(Address::GLOBAL, ..)` sent a long message as an unpaced BAM and
+  then waited for a CTS that cannot come, so it also timed out. It now defers to
+  `broadcast`.
+- `AddressClaimer::claim` on an ECU that had given up would announce a claim
+  *from* the null address and, once the window closed, leave it believing it held
+  `0xFE`.
+- `on_commanded_address` accepted `0xFE`/`0xFF`, leaving the ECU transmitting
+  from a reserved address.
+- A repeated TP.DT packet and a skipped one aborted with the same reason;
+  J1939-21 distinguishes them, because they indicate different faults.
+- `packet_count` wrapped to `0` above 1785 bytes — the one answer that is
+  actively dangerous, since it reads as "no packets needed". It now saturates.
+
 - **Testing** — `tools/check.sh` runs every gate and fails on the first problem.
   `core/tests/codec_sweep.rs` sweeps the whole input space where feasible: all
   262,144 PGNs, every identifier prefix, every bit-packed field value, and the
   reserved-range boundary at all 32 SPN widths. `core/tests/robustness.rs`
   asserts that arbitrary bytes cannot panic any decoder or the top-level
-  dispatch.
+  dispatch. `core/tests/wire_conformance.rs` checks byte layouts against the
+  Open-SAE-J1939 C reference, rebuilding its shift/mask arithmetic longhand so
+  the comparison is independent rather than a round trip of our own encoder.
+  `core/tests/multi_node.rs` covers several ECUs interacting: address contention
+  between three nodes, transfers running in both directions at once, four peers
+  broadcasting with interleaved packets, and a node relocating mid-transfer.
 
 - **Project setup** — dual MIT/Apache-2.0 licensing, DCO-based contribution
   policy, Contributor Covenant code of conduct, issue and PR templates

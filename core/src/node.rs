@@ -38,12 +38,13 @@
 
 use crate::address_claim::{AddressClaimer, ClaimAction, ClaimState};
 use crate::frame::Frame;
+use crate::frame::MAX_PAYLOAD;
 use crate::id::Id;
 use crate::name::Name;
 use crate::pgn::{self, Pgn};
 use crate::request::Request;
-use crate::tp::{Reassembler, Rx, TpCm, TpDt};
-use crate::types::{Address, Priority};
+use crate::tp::{AbortReason, Reassembler, Rx, TpCm, TpDt, Transmitter, Tx};
+use crate::types::{Address, Priority, Result};
 
 /// How long J1939-81 gives other ECUs to contest an address claim.
 pub const ADDRESS_CLAIM_WINDOW_MS: u16 = 250;
@@ -67,6 +68,223 @@ pub enum Event<'a> {
         /// acknowledgement closing an RTS/CTS transfer. Transmit it if present.
         reply: Option<Frame>,
     },
+}
+
+/// What an [`Outgoing`] message wants next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    /// Nothing to do — wait for the peer, or for the pacing interval.
+    Idle,
+    /// More frames are ready; pull them with [`Outgoing::next_frame`].
+    Ready,
+    /// The whole message has been sent, and acknowledged if it needed to be.
+    Complete,
+    /// The peer aborted the transfer.
+    Aborted(AbortReason),
+}
+
+/// A message on its way out, however many frames that takes.
+///
+/// Sending a J1939 message is not one decision but three: does it fit in a
+/// frame, is it addressed or broadcast, and if it is neither short nor
+/// broadcast, who drives the handshake? `Outgoing` answers all three and hands
+/// back frames.
+///
+/// It borrows the payload rather than copying it, so a 1785-byte message costs
+/// no extra RAM — the point of the type on a microcontroller.
+///
+/// ```
+/// use sae_j1939_rs::node::Outgoing;
+/// use sae_j1939_rs::{pgn, Address};
+///
+/// // Eight bytes or fewer: a single frame, done.
+/// let mut short = Outgoing::new(pgn::DM1, Address::new(0x80), Address::GLOBAL, &[0; 8]).unwrap();
+/// assert!(short.next_frame().is_some());
+/// assert!(short.next_frame().is_none());
+/// assert!(short.is_complete());
+///
+/// // Longer, and broadcast: a BAM announcement followed by data packets.
+/// let mut long = Outgoing::new(pgn::DM1, Address::new(0x80), Address::GLOBAL, &[0; 14]).unwrap();
+/// assert!(long.needs_pacing(), "BAM packets must be spaced 50-200 ms apart");
+/// assert_eq!(long.frame_count(), 3); // announcement plus two packets
+/// while long.next_frame().is_some() {}
+/// assert!(long.is_complete());
+/// ```
+///
+/// A destination-specific message longer than eight bytes needs the peer's
+/// permission, so feed replies back with [`Outgoing::on_frame`]:
+///
+/// ```
+/// # use sae_j1939_rs::node::{Outgoing, Progress};
+/// # use sae_j1939_rs::{pgn, Address};
+/// let mut tx = Outgoing::new(pgn::DM1, Address::new(0x80), Address::new(0x90), &[0; 14]).unwrap();
+/// let rts = tx.next_frame().expect("the request to send");
+/// assert!(tx.next_frame().is_none(), "nothing more until the peer answers");
+/// assert!(!tx.needs_pacing(), "RTS/CTS is flow-controlled, not timed");
+/// # let _ = (rts, Progress::Idle);
+/// ```
+#[derive(Debug)]
+pub struct Outgoing<'a> {
+    pgn: Pgn,
+    priority: Priority,
+    source: Address,
+    destination: Address,
+    state: OutgoingState<'a>,
+}
+
+#[derive(Debug)]
+enum OutgoingState<'a> {
+    /// A message that fits one frame. The payload is kept rather than a built
+    /// frame so that `with_priority` stays a plain field assignment.
+    Single { data: &'a [u8], sent: bool },
+    /// A message crossing the transport protocol.
+    Multi {
+        transmitter: Transmitter<'a>,
+        announced: bool,
+    },
+}
+
+impl<'a> Outgoing<'a> {
+    /// Prepare `data` for transmission as parameter group `pgn`.
+    ///
+    /// Picks the mechanism for you: a single frame if it fits, a BAM if it does
+    /// not and `destination` is [`Address::GLOBAL`], and an RTS/CTS handshake
+    /// otherwise.
+    ///
+    /// Returns [`Error::InvalidMessageSize`](crate::Error::InvalidMessageSize)
+    /// for a multi-frame message outside the protocol's 9..=1785 byte range, or
+    /// [`Error::DestinationMismatch`](crate::Error::DestinationMismatch) if a
+    /// PDU2 parameter group is addressed to a specific ECU.
+    pub fn new(pgn: Pgn, source: Address, destination: Address, data: &'a [u8]) -> Result<Self> {
+        let priority = Priority::DEFAULT;
+        let state = if data.len() <= MAX_PAYLOAD {
+            // Validate now so `next_frame` cannot fail later.
+            let id = Id::from_parts(priority, pgn, destination, source)?;
+            Frame::new(id, data)?;
+            OutgoingState::Single { data, sent: false }
+        } else if destination.is_broadcast() {
+            OutgoingState::Multi {
+                transmitter: Transmitter::broadcast(pgn, data)?,
+                announced: false,
+            }
+        } else {
+            OutgoingState::Multi {
+                transmitter: Transmitter::addressed(pgn, data)?,
+                announced: false,
+            }
+        };
+        Ok(Outgoing {
+            pgn,
+            priority,
+            source,
+            destination,
+            state,
+        })
+    }
+
+    /// Send the single-frame case at a priority other than
+    /// [`Priority::DEFAULT`].
+    ///
+    /// Transport-protocol frames always use [`Priority::LOWEST`], as J1939-21
+    /// requires, so this affects only messages that fit one frame.
+    #[must_use]
+    pub fn with_priority(mut self, priority: Priority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Whether the caller must space frames out.
+    ///
+    /// True only for a BAM: J1939-21 requires 50–200 ms between broadcast data
+    /// packets, and nothing acknowledges them, so a receiver on a busy bus will
+    /// drop a transfer sent back to back. An RTS/CTS transfer is flow-controlled
+    /// by the peer instead, and a single frame needs no pacing at all.
+    pub fn needs_pacing(&self) -> bool {
+        matches!(&self.state, OutgoingState::Multi { transmitter, .. }
+            if self.destination.is_broadcast() && transmitter.packets() > 0)
+    }
+
+    /// How many frames this message will take in total.
+    pub fn frame_count(&self) -> usize {
+        match &self.state {
+            OutgoingState::Single { .. } => 1,
+            // The announcement plus one frame per packet.
+            OutgoingState::Multi { transmitter, .. } => 1 + transmitter.packets() as usize,
+        }
+    }
+
+    /// Whether everything has been sent, and acknowledged if it had to be.
+    pub fn is_complete(&self) -> bool {
+        match &self.state {
+            OutgoingState::Single { sent, .. } => *sent,
+            OutgoingState::Multi { transmitter, .. } => transmitter.is_complete(),
+        }
+    }
+
+    /// The next frame to put on the bus.
+    ///
+    /// `None` means there is nothing to send *right now*: either the message is
+    /// finished, or an RTS/CTS transfer is waiting for the peer to grant another
+    /// window. Check [`Outgoing::is_complete`] to tell the two apart.
+    pub fn next_frame(&mut self) -> Option<Frame> {
+        let (priority, pgn, source, destination) =
+            (self.priority, self.pgn, self.source, self.destination);
+        match &mut self.state {
+            OutgoingState::Single { data, sent } => {
+                if *sent {
+                    return None;
+                }
+                // Marked sent first: both calls below were validated in `new`,
+                // and treating an impossible failure as "nothing more to send"
+                // is better than hanging a caller that loops until complete.
+                *sent = true;
+                let id = Id::from_parts(priority, pgn, destination, source).ok()?;
+                Frame::new(id, data).ok()
+            }
+            OutgoingState::Multi {
+                transmitter,
+                announced,
+            } => {
+                if !*announced {
+                    *announced = true;
+                    let id = tp_id(pgn::TP_CM, destination, source)?;
+                    return Some(Frame::from_payload(id, transmitter.start().encode()));
+                }
+                let packet = transmitter.next_packet()?;
+                let id = tp_id(pgn::TP_DT, destination, source)?;
+                Some(Frame::from_payload(id, packet.encode()))
+            }
+        }
+    }
+
+    /// Feed back a frame received from the peer.
+    ///
+    /// Only connection-management frames from this message's destination matter;
+    /// anything else is reported as [`Progress::Idle`] and should be handled
+    /// normally.
+    pub fn on_frame(&mut self, frame: &Frame) -> Progress {
+        let OutgoingState::Multi { transmitter, .. } = &mut self.state else {
+            return Progress::Idle;
+        };
+        if frame.pgn() != pgn::TP_CM || frame.source_address() != self.destination {
+            return Progress::Idle;
+        }
+        let Ok(cm) = TpCm::decode(frame.payload()) else {
+            return Progress::Idle;
+        };
+        match transmitter.on_tp_cm(&cm) {
+            Tx::SendData => Progress::Ready,
+            Tx::Complete => Progress::Complete,
+            Tx::Aborted(reason) => Progress::Aborted(reason),
+            Tx::Idle => Progress::Idle,
+        }
+    }
+}
+
+/// Transport-protocol frames are priority 7 so bulk transfers yield to control
+/// traffic.
+fn tp_id(group: Pgn, destination: Address, source: Address) -> Option<Id> {
+    Id::from_parts(Priority::LOWEST, group, destination, source).ok()
 }
 
 /// One J1939 node: a NAME, an address, and the machinery to keep them.
@@ -194,6 +412,11 @@ impl<const BUF: usize, const SESSIONS: usize> Node<BUF, SESSIONS> {
 
         if group == pgn::TP_CM {
             return match TpCm::decode(frame.payload()) {
+                // An RTS is destination-specific by definition, and a broadcast
+                // one is not merely malformed but dangerous: every ECU that
+                // answered it would put a CTS on the bus, turning one bad frame
+                // into a storm. A broadcast transfer is announced with a BAM.
+                Ok(TpCm::Rts { .. }) if id.is_broadcast() => Event::Idle,
                 Ok(cm) => {
                     let address = self.claimer.address();
                     Self::lift(self.reassembler.on_tp_cm(source, &cm), address, source)
@@ -292,6 +515,200 @@ mod tests {
 
     fn node() -> Node<256> {
         Node::new(name_for(1, 300), Address::new(0x80))
+    }
+
+    #[test]
+    fn priority_applies_to_a_single_frame_message() {
+        let mut tx = Outgoing::new(pgn::DM1, Address::new(0x80), Address::GLOBAL, &[1, 2, 3])
+            .unwrap()
+            .with_priority(Priority::HIGHEST);
+        let frame = tx.next_frame().unwrap();
+        assert_eq!(frame.id().priority(), Priority::HIGHEST);
+        assert_eq!(frame.data(), &[1, 2, 3], "the payload is not disturbed");
+    }
+
+    #[test]
+    fn transport_protocol_frames_ignore_the_requested_priority() {
+        // J1939-21 fixes TP traffic at priority 7 so bulk transfers yield.
+        let mut tx = Outgoing::new(pgn::DM1, Address::new(0x80), Address::GLOBAL, &[0; 14])
+            .unwrap()
+            .with_priority(Priority::HIGHEST);
+        while let Some(frame) = tx.next_frame() {
+            assert_eq!(frame.id().priority(), Priority::LOWEST);
+        }
+    }
+
+    #[test]
+    fn a_short_message_is_one_frame_and_needs_no_pacing() {
+        let mut tx =
+            Outgoing::new(pgn::DM1, Address::new(0x80), Address::GLOBAL, &[1, 2, 3]).unwrap();
+        assert_eq!(tx.frame_count(), 1);
+        assert!(!tx.needs_pacing());
+
+        let frame = tx.next_frame().expect("one frame");
+        assert_eq!(frame.pgn(), pgn::DM1);
+        assert_eq!(frame.data(), &[1, 2, 3]);
+        assert!(tx.is_complete());
+        assert!(tx.next_frame().is_none());
+    }
+
+    #[test]
+    fn a_long_broadcast_becomes_a_paced_bam() {
+        let payload = [7u8; 14];
+        let mut tx =
+            Outgoing::new(pgn::DM1, Address::new(0x80), Address::GLOBAL, &payload).unwrap();
+        assert!(tx.needs_pacing(), "a BAM has no flow control but timing");
+        assert_eq!(tx.frame_count(), 3);
+
+        let announcement = tx.next_frame().expect("the BAM");
+        assert_eq!(announcement.pgn(), pgn::TP_CM);
+        assert_eq!(announcement.id().priority(), Priority::LOWEST);
+        assert!(matches!(
+            TpCm::decode(announcement.payload()).unwrap(),
+            TpCm::Bam {
+                size: 14,
+                packets: 2,
+                ..
+            }
+        ));
+
+        let mut packets = 0;
+        while let Some(frame) = tx.next_frame() {
+            assert_eq!(frame.pgn(), pgn::TP_DT);
+            packets += 1;
+        }
+        assert_eq!(packets, 2);
+        assert!(tx.is_complete());
+    }
+
+    /// An addressed message must wait for permission, and is not finished until
+    /// the peer acknowledges it.
+    #[test]
+    fn a_long_addressed_message_runs_the_handshake() {
+        let peer = Address::new(0x90);
+        let payload = [3u8; 21];
+        let mut tx = Outgoing::new(pgn::DM1, Address::new(0x80), peer, &payload).unwrap();
+        assert!(!tx.needs_pacing(), "RTS/CTS is flow-controlled, not paced");
+
+        let rts = tx.next_frame().expect("the RTS");
+        assert_eq!(rts.pgn(), pgn::TP_CM);
+        assert_eq!(rts.id().destination_address(), Some(peer));
+        assert!(
+            tx.next_frame().is_none(),
+            "nothing may go out before the peer grants a window"
+        );
+        assert!(!tx.is_complete());
+
+        // The peer grants everything at once.
+        let cts = Frame::from_payload(
+            Id::from_parts(Priority::LOWEST, pgn::TP_CM, Address::new(0x80), peer).unwrap(),
+            TpCm::Cts {
+                packets: 3,
+                next_packet: 1,
+                pgn: pgn::DM1,
+            }
+            .encode(),
+        );
+        assert_eq!(tx.on_frame(&cts), Progress::Ready);
+
+        let mut packets = 0;
+        while let Some(frame) = tx.next_frame() {
+            assert_eq!(frame.pgn(), pgn::TP_DT);
+            packets += 1;
+        }
+        assert_eq!(packets, 3);
+        assert!(!tx.is_complete(), "not done until acknowledged");
+
+        let ack = Frame::from_payload(
+            Id::from_parts(Priority::LOWEST, pgn::TP_CM, Address::new(0x80), peer).unwrap(),
+            TpCm::EndOfMsgAck {
+                size: 21,
+                packets: 3,
+                pgn: pgn::DM1,
+            }
+            .encode(),
+        );
+        assert_eq!(tx.on_frame(&ack), Progress::Complete);
+        assert!(tx.is_complete());
+    }
+
+    #[test]
+    fn an_abort_from_the_peer_is_reported() {
+        let peer = Address::new(0x90);
+        let mut tx = Outgoing::new(pgn::DM1, Address::new(0x80), peer, &[0; 21]).unwrap();
+        tx.next_frame();
+
+        let abort = Frame::from_payload(
+            Id::from_parts(Priority::LOWEST, pgn::TP_CM, Address::new(0x80), peer).unwrap(),
+            TpCm::Abort {
+                reason: AbortReason::ResourcesUnavailable,
+                pgn: pgn::DM1,
+            }
+            .encode(),
+        );
+        assert_eq!(
+            tx.on_frame(&abort),
+            Progress::Aborted(AbortReason::ResourcesUnavailable)
+        );
+    }
+
+    #[test]
+    fn traffic_from_other_ecus_does_not_disturb_a_transfer() {
+        let peer = Address::new(0x90);
+        let mut tx = Outgoing::new(pgn::DM1, Address::new(0x80), peer, &[0; 21]).unwrap();
+        tx.next_frame();
+
+        // The same CTS, but from an unrelated ECU.
+        let stray = Frame::from_payload(
+            Id::from_parts(
+                Priority::LOWEST,
+                pgn::TP_CM,
+                Address::new(0x80),
+                Address::new(0x17),
+            )
+            .unwrap(),
+            TpCm::Cts {
+                packets: 3,
+                next_packet: 1,
+                pgn: pgn::DM1,
+            }
+            .encode(),
+        );
+        assert_eq!(tx.on_frame(&stray), Progress::Idle);
+        assert!(
+            tx.next_frame().is_none(),
+            "a stray CTS must not open our window"
+        );
+    }
+
+    #[test]
+    fn a_pdu2_group_cannot_be_addressed_to_one_ecu() {
+        // DM1 is PDU2: broadcast only.
+        assert!(Outgoing::new(pgn::DM1, Address::new(0x80), Address::new(0x90), &[0; 8]).is_err());
+        // ...but the transport protocol carries it to one ECU perfectly well,
+        // because the TP frames are PDU1 and the PGN travels in their payload.
+        assert!(Outgoing::new(pgn::DM1, Address::new(0x80), Address::new(0x90), &[0; 21]).is_ok());
+    }
+
+    /// What one node sends, another must reassemble.
+    #[test]
+    fn an_outgoing_broadcast_arrives_at_a_receiving_node() {
+        let sender = Address::new(0x00);
+        let payload: [u8; 40] = core::array::from_fn(|i| (i * 3) as u8);
+
+        let mut node = node();
+        node.start();
+        node.tick(ADDRESS_CLAIM_WINDOW_MS, |_| {});
+
+        let mut tx = Outgoing::new(pgn::DM1, sender, Address::GLOBAL, &payload).unwrap();
+        let mut delivered = None;
+        while let Some(frame) = tx.next_frame() {
+            if let Event::Message { pgn, data, .. } = node.on_frame(&frame) {
+                assert_eq!(pgn, pgn::DM1);
+                delivered = Some(data.to_vec());
+            }
+        }
+        assert_eq!(delivered.as_deref(), Some(payload.as_slice()));
     }
 
     #[test]

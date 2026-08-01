@@ -48,9 +48,36 @@ const PGN_SHIFT: u32 = 8;
 /// Construct one from the wire with [`Id::new`], or from its components with
 /// [`Id::from_parts`] / [`Id::broadcast`]. The struct stores the raw identifier
 /// and decodes fields on access, so it is [`Copy`] and free of hidden state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Id {
     raw: u32,
+}
+
+/// Prints as the eight hex digits every CAN tool shows, e.g. `18FECA80`.
+impl core::fmt::Display for Id {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:08X}", self.raw)
+    }
+}
+
+/// Prints the identifier and what it decodes to, because a bare number is not
+/// something anyone can check at a glance.
+impl core::fmt::Debug for Id {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "Id({:08X} prio={} pgn={:#08X} sa={}",
+            self.raw,
+            self.priority().as_u8(),
+            self.pgn().as_u32(),
+            self.source_address(),
+        )?;
+        match self.destination_address() {
+            Some(destination) => write!(f, " da={destination})"),
+            // PDU2: the byte is a group extension, not a destination.
+            None => f.write_str(" broadcast)"),
+        }
+    }
 }
 
 impl Id {
@@ -402,6 +429,27 @@ mod tests {
                 Id::from_parts(id.priority(), id.pgn(), destination, id.source_address()).unwrap();
             assert_eq!(rebuilt.as_u32(), raw, "round trip of {raw:#010x}");
         }
+    }
+
+    #[test]
+    fn identifiers_print_as_hex_and_decode_in_debug() {
+        extern crate std;
+        use std::format;
+
+        // PDU1, addressed.
+        let request = Id::new(0x18EA9080).unwrap();
+        assert_eq!(format!("{request}"), "18EA9080");
+        assert_eq!(
+            format!("{request:?}"),
+            "Id(18EA9080 prio=6 pgn=0x00EA00 sa=0x80 da=0x90)"
+        );
+
+        // PDU2 has no destination to report.
+        let dm1 = Id::new(0x18FECA80).unwrap();
+        assert_eq!(
+            format!("{dm1:?}"),
+            "Id(18FECA80 prio=6 pgn=0x00FECA sa=0x80 broadcast)"
+        );
     }
 
     #[test]

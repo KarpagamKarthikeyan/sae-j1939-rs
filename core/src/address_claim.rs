@@ -150,7 +150,17 @@ impl AddressClaimer {
     /// The returned [`Claim`] must be sent as PGN `0x00EE00` to
     /// [`Address::GLOBAL`]. The ECU then enters [`ClaimState::Claiming`] until
     /// [`AddressClaimer::contention_window_elapsed`] is called.
+    ///
+    /// Only a specific address (`0..=253`) can be claimed. Calling this on an
+    /// ECU that has already given up — which holds [`Address::NULL`] — produces
+    /// the Cannot Claim Address message again and leaves it in
+    /// [`ClaimState::CannotClaim`], because there is nothing to claim. Retrying
+    /// blindly is otherwise a natural thing for a host program to do, and would
+    /// leave the ECU believing it held `0xFE` once the window closed.
     pub fn claim(&mut self) -> Claim {
+        if !self.address.is_specific() {
+            return self.give_up();
+        }
         self.state = ClaimState::Claiming;
         self.current_claim()
     }
@@ -211,7 +221,10 @@ impl AddressClaimer {
     ///
     /// A command naming a different ECU is ignored ([`ClaimAction::Idle`]).
     ///
-    /// Returns [`Error::ShortPayload`] if fewer than nine bytes are supplied.
+    /// Returns [`Error::ShortPayload`] if fewer than nine bytes are supplied, or
+    /// [`Error::ValueOutOfRange`] if the commanded address is not a specific one
+    /// — `0xFE` and `0xFF` are reserved, and taking either would leave this ECU
+    /// transmitting from the null or global address.
     pub fn on_commanded_address(&mut self, data: &[u8]) -> Result<ClaimAction> {
         if data.len() < COMMANDED_ADDRESS_LEN {
             return Err(Error::ShortPayload {
@@ -225,7 +238,14 @@ impl AddressClaimer {
             // Addressed to a different ECU.
             return Ok(ClaimAction::Idle);
         }
-        self.address = Address::new(data[8]);
+        let commanded = Address::new(data[8]);
+        if !commanded.is_specific() {
+            return Err(Error::ValueOutOfRange {
+                field: "commanded address",
+                value: data[8] as u32,
+            });
+        }
+        self.address = commanded;
         self.state = ClaimState::Claiming;
         Ok(ClaimAction::Announce(self.current_claim()))
     }
@@ -499,6 +519,65 @@ mod tests {
             ClaimAction::Idle
         );
         assert_eq!(ecu.address(), Address::new(0x80));
+    }
+
+    /// An ECU that gave up holds the null address. Claiming again would
+    /// otherwise announce a claim *from* `0xFE` and, once the window closed,
+    /// leave the ECU believing it held it.
+    #[test]
+    fn reclaiming_after_giving_up_does_not_claim_the_null_address() {
+        let name = name_with(100);
+        let mut ecu = AddressClaimer::new(name, Address::new(0x80));
+        ecu.claim();
+        ecu.contention_window_elapsed();
+        ecu.give_up();
+        assert_eq!(ecu.address(), Address::NULL);
+
+        let retry = ecu.claim();
+        assert!(retry.is_cannot_claim(), "0xFE is not a claimable address");
+        assert_eq!(ecu.state(), ClaimState::CannotClaim);
+
+        // And the window closing must not promote it to Claimed.
+        ecu.contention_window_elapsed();
+        assert_eq!(ecu.state(), ClaimState::CannotClaim);
+        assert_eq!(ecu.address(), Address::NULL);
+    }
+
+    /// A Commanded Address naming a reserved value would leave this ECU
+    /// transmitting from the null or global address.
+    #[test]
+    fn a_commanded_address_must_name_a_specific_address() {
+        let name = name_with(100);
+        let mut ecu = AddressClaimer::new(name, Address::new(0x80));
+        ecu.claim();
+        ecu.contention_window_elapsed();
+
+        for reserved in [0xFEu8, 0xFF] {
+            let mut command = [0u8; COMMANDED_ADDRESS_LEN];
+            command[..8].copy_from_slice(&name.to_bytes());
+            command[8] = reserved;
+
+            assert_eq!(
+                ecu.on_commanded_address(&command),
+                Err(Error::ValueOutOfRange {
+                    field: "commanded address",
+                    value: reserved as u32
+                }),
+                "{reserved:#04X} must be refused"
+            );
+            assert_eq!(
+                ecu.address(),
+                Address::new(0x80),
+                "the address is unchanged"
+            );
+        }
+
+        // The last specific address is still accepted.
+        let mut command = [0u8; COMMANDED_ADDRESS_LEN];
+        command[..8].copy_from_slice(&name.to_bytes());
+        command[8] = 0xFD;
+        assert!(ecu.on_commanded_address(&command).is_ok());
+        assert_eq!(ecu.address(), Address::new(0xFD));
     }
 
     #[test]
