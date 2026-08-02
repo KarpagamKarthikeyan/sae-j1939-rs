@@ -80,6 +80,7 @@
 //! |--------|-----------|----------------|
 //! | [`id`], [`pgn`], [`frame`] | J1939-21 | The 29-bit identifier, parameter groups, single frames |
 //! | [`tp`] | J1939-21 | Transport protocol: BAM and RTS/CTS, up to 1785 bytes |
+//! | [`etp`] | J1939-21 | Extended transport protocol: up to 117 MB |
 //! | [`name`] | J1939-81 | The 64-bit ECU NAME |
 //! | [`address_claim`] | J1939-81 | Claiming, defending, and relocating an address |
 //! | [`diagnostics`] | J1939-73 | DM1/DM2 trouble codes and lamp status |
@@ -117,6 +118,7 @@ extern crate std;
 pub mod address_claim;
 pub mod can;
 pub mod diagnostics;
+pub mod etp;
 pub mod frame;
 pub mod id;
 pub mod identification;

@@ -14,6 +14,13 @@ pub use sae_j1939_rs;
 /// The transport boundary: what an [`ecu::Ecu`] needs from a CAN bus.
 pub mod bus;
 
+/// Reading signal definitions from a DBC file.
+///
+/// The industry-standard way to describe CAN signals, so the parameter database
+/// is yours rather than whatever the crate happened to hardcode. Cross-platform:
+/// a DBC file is text and carries no OS dependency.
+pub mod dbc;
+
 /// A running ECU: a bus and the protocol stack wired together.
 ///
 /// Start here unless you need the pieces separately. Generic over

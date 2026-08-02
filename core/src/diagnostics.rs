@@ -454,6 +454,211 @@ pub mod dm3 {
     }
 }
 
+/// DM11 — clear *active* diagnostic trouble codes (PGN `0x00FED3`).
+///
+/// The counterpart to [`dm3`], which clears previously active codes. Like DM3
+/// it carries no payload of its own: it is issued as a [`Request`], and the
+/// target answers with an [`Acknowledgement`].
+///
+/// ```
+/// use sae_j1939_rs::diagnostics::dm11;
+/// use sae_j1939_rs::pgn;
+///
+/// assert_eq!(dm11::clear_request().pgn, pgn::DM11);
+/// ```
+///
+/// # Clearing active codes is not a diagnostic step
+///
+/// A *previously active* code is history; an *active* one is a fault happening
+/// now. Clearing it does not fix anything — the ECU will simply set it again if
+/// the condition persists, and if it does not, you have destroyed the evidence.
+/// Read the codes first.
+pub mod dm11 {
+    use super::*;
+
+    /// The Request that tells an ECU to clear its active trouble codes.
+    pub const fn clear_request() -> Request {
+        Request::new(pgn::DM11)
+    }
+
+    /// Whether an incoming [`Request`] is asking this ECU to clear active codes.
+    pub fn is_clear_request(request: &Request) -> bool {
+        request.pgn == pgn::DM11
+    }
+
+    /// The positive acknowledgement to send once the codes are cleared.
+    pub const fn acknowledge(responder: Address) -> Acknowledgement {
+        Acknowledgement::positive(pgn::DM11, responder)
+    }
+
+    /// The refusal to send when the codes cannot be cleared — typically because
+    /// the vehicle is not in a safe state for it.
+    pub const fn refuse(responder: Address, reason: AckControl) -> Acknowledgement {
+        Acknowledgement {
+            control: reason,
+            group_function: 0xFF,
+            address: responder,
+            pgn: pgn::DM11,
+        }
+    }
+}
+
+/// DM13 — stop/start broadcast (PGN `0x00DF00`).
+///
+/// Tells ECUs to pause their periodic broadcasts so a tool can work on a quiet
+/// bus, then to resume. The payload holds a two-bit command per network, plus a
+/// hold signal.
+///
+/// ```
+/// use sae_j1939_rs::diagnostics::{BroadcastCommand, Dm13, Network};
+///
+/// // Quieten the vehicle bus, leave the others alone.
+/// let stop = Dm13::new().with_command(Network::Vehicle, BroadcastCommand::Stop);
+/// assert_eq!(stop.command(Network::Vehicle), BroadcastCommand::Stop);
+/// assert_eq!(stop.command(Network::Implement), BroadcastCommand::DoNotCare);
+/// assert_eq!(Dm13::decode(&stop.encode()), stop);
+/// ```
+///
+/// # A stopped bus stays stopped
+///
+/// J1939-73 requires the tool to keep sending a hold signal roughly every
+/// second; ECUs resume on their own if it stops arriving. That is a safety
+/// interlock — a tool that crashes must not leave the vehicle silent. This type
+/// encodes the messages; the repetition is the caller's, since the state
+/// machines own no clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Dm13 {
+    /// Byte 0: two bits per network, in [`Network`] order.
+    networks: u8,
+    /// Byte 1: the hold signal.
+    hold: u8,
+}
+
+/// Which network a [`Dm13`] command applies to.
+///
+/// The four J1939-73 names the payload's first byte carries, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Network {
+    /// The current data link the message arrived on.
+    CurrentDataLink,
+    /// The vehicle bus (J1939 network #1).
+    Vehicle,
+    /// The implement bus (J1939 network #2).
+    Implement,
+    /// A manufacturer-specific fifth network slot.
+    Proprietary,
+}
+
+impl Network {
+    /// Every network, in the order the payload packs them.
+    pub const ALL: [Network; 4] = [
+        Network::CurrentDataLink,
+        Network::Vehicle,
+        Network::Implement,
+        Network::Proprietary,
+    ];
+
+    const fn shift(self) -> u8 {
+        match self {
+            Network::CurrentDataLink => 0,
+            Network::Vehicle => 2,
+            Network::Implement => 4,
+            Network::Proprietary => 6,
+        }
+    }
+}
+
+/// What a [`Dm13`] asks a network to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BroadcastCommand {
+    /// Stop broadcasting.
+    Stop,
+    /// Resume broadcasting.
+    Start,
+    /// Reserved by J1939-73.
+    Reserved,
+    /// Leave this network as it is — the default, so a command aimed at one bus
+    /// does not silence the others.
+    #[default]
+    DoNotCare,
+}
+
+impl BroadcastCommand {
+    const fn to_bits(self) -> u8 {
+        match self {
+            BroadcastCommand::Stop => 0,
+            BroadcastCommand::Start => 1,
+            BroadcastCommand::Reserved => 2,
+            BroadcastCommand::DoNotCare => 3,
+        }
+    }
+
+    const fn from_bits(bits: u8) -> Self {
+        match bits & 0b11 {
+            0 => BroadcastCommand::Stop,
+            1 => BroadcastCommand::Start,
+            2 => BroadcastCommand::Reserved,
+            _ => BroadcastCommand::DoNotCare,
+        }
+    }
+}
+
+impl Dm13 {
+    /// A message that asks nothing of any network.
+    ///
+    /// Every field defaults to [`BroadcastCommand::DoNotCare`], so building one
+    /// up cannot silence a bus you did not name.
+    pub const fn new() -> Self {
+        // 0b11 in every slot is "do not care".
+        Dm13 {
+            networks: 0xFF,
+            hold: 0xFF,
+        }
+    }
+
+    /// What this message asks of one network.
+    pub const fn command(&self, network: Network) -> BroadcastCommand {
+        BroadcastCommand::from_bits(self.networks >> network.shift())
+    }
+
+    /// Set what this message asks of one network.
+    #[must_use]
+    pub const fn with_command(self, network: Network, command: BroadcastCommand) -> Self {
+        let shift = network.shift();
+        Dm13 {
+            networks: (self.networks & !(0b11 << shift)) | (command.to_bits() << shift),
+            hold: self.hold,
+        }
+    }
+
+    /// The hold signal byte, which keeps a stopped bus stopped.
+    pub const fn hold_signal(&self) -> u8 {
+        self.hold
+    }
+
+    /// Set the hold signal byte.
+    #[must_use]
+    pub const fn with_hold_signal(self, hold: u8) -> Self {
+        Dm13 {
+            networks: self.networks,
+            hold,
+        }
+    }
+
+    /// Encode to the eight-byte payload.
+    pub const fn encode(&self) -> [u8; 8] {
+        [self.networks, self.hold, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+    }
+
+    /// Decode an eight-byte payload.
+    pub const fn decode(data: &[u8; 8]) -> Self {
+        Dm13 {
+            networks: data[0],
+            hold: data[1],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +681,82 @@ mod tests {
         assert_eq!(refusal.control, AckControl::Busy);
         assert!(!refusal.control.is_positive());
         assert_eq!(refusal.pgn, pgn::DM3);
+    }
+
+    #[test]
+    fn dm11_round_trips_as_a_request_and_acknowledgement() {
+        let request = dm11::clear_request();
+        assert_eq!(request.pgn, pgn::DM11);
+        assert_eq!(request.encode(), [0xD3, 0xFE, 0x00]);
+        assert!(dm11::is_clear_request(
+            &Request::decode(&request.encode()).unwrap()
+        ));
+        // DM3 clears previously active codes; DM11 clears active ones. Confusing
+        // them would clear the wrong set.
+        assert!(!dm11::is_clear_request(&dm3::clear_request()));
+        assert!(!dm3::is_clear_request(&dm11::clear_request()));
+
+        assert!(dm11::acknowledge(Address::new(0x80)).control.is_positive());
+        assert_eq!(
+            dm11::refuse(Address::new(0x80), AckControl::Busy).control,
+            AckControl::Busy
+        );
+    }
+
+    /// A command aimed at one bus must not silence the others, so every network
+    /// this message does not name stays "do not care".
+    #[test]
+    fn dm13_leaves_unnamed_networks_alone() {
+        let quiet = Dm13::new().with_command(Network::Vehicle, BroadcastCommand::Stop);
+        assert_eq!(quiet.command(Network::Vehicle), BroadcastCommand::Stop);
+        for other in [
+            Network::CurrentDataLink,
+            Network::Implement,
+            Network::Proprietary,
+        ] {
+            assert_eq!(
+                quiet.command(other),
+                BroadcastCommand::DoNotCare,
+                "{other:?} was not named and must be untouched"
+            );
+        }
+        // A fresh message asks nothing of anyone.
+        for network in Network::ALL {
+            assert_eq!(Dm13::new().command(network), BroadcastCommand::DoNotCare);
+        }
+    }
+
+    #[test]
+    fn dm13_packs_every_network_independently() {
+        let commands = [
+            BroadcastCommand::Stop,
+            BroadcastCommand::Start,
+            BroadcastCommand::Reserved,
+            BroadcastCommand::DoNotCare,
+        ];
+        for network in Network::ALL {
+            for command in commands {
+                let message = Dm13::new().with_command(network, command);
+                assert_eq!(message.command(network), command);
+                assert_eq!(Dm13::decode(&message.encode()), message);
+
+                // Setting the same field twice replaces rather than ORs.
+                let replaced = message.with_command(network, BroadcastCommand::Start);
+                assert_eq!(replaced.command(network), BroadcastCommand::Start);
+            }
+        }
+    }
+
+    #[test]
+    fn dm13_round_trips_including_the_hold_signal() {
+        let message = Dm13::new()
+            .with_command(Network::Vehicle, BroadcastCommand::Stop)
+            .with_command(Network::Implement, BroadcastCommand::Start)
+            .with_hold_signal(0x00);
+        let bytes = message.encode();
+        assert_eq!(&bytes[2..], &[0xFF; 6], "the tail is reserved filler");
+        assert_eq!(Dm13::decode(&bytes), message);
+        assert_eq!(Dm13::decode(&bytes).hold_signal(), 0x00);
     }
 
     #[test]

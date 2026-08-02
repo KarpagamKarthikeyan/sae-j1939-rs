@@ -1,12 +1,10 @@
 // Copyright (c) 2026 Karpagam Karthikeyan
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! ISO 11783 (ISOBUS): tractor and implement hydraulics.
+//! Hydraulic valves (ISO 11783-7).
 //!
-//! ISO 11783 builds on J1939 for agricultural and forestry equipment. This
-//! module covers the auxiliary and general purpose valve groups from
-//! ISO 11783-7 — the messages a tractor and a mounted implement exchange to
-//! move hydraulic cylinders.
+//! The messages a tractor and a mounted implement exchange to move hydraulic
+//! cylinders.
 //!
 //! A tractor has up to **16 auxiliary valves**, and each gets its own PGN in
 //! three blocks:

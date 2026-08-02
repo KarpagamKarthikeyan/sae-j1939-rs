@@ -223,7 +223,20 @@ impl Spn {
 }
 
 /// Classify a raw field against the reserved values at the top of a parameter's
-/// range.
+/// range, without a [`Spn`] to hand.
+///
+/// Useful when the parameter's geometry comes from somewhere other than a
+/// compile-time definition — a DBC file loaded at runtime, for instance. The
+/// reserved-range rules are J1939's, not a property of how the field was
+/// described, so they should not be reimplemented per source.
+///
+/// ```
+/// use sae_j1939_rs::spn::{classify, RawValue};
+///
+/// assert_eq!(classify(200, 8), RawValue::Valid(200));
+/// assert_eq!(classify(0xFE, 8), RawValue::Error);
+/// assert_eq!(classify(0xFF, 8), RawValue::NotAvailable);
+/// ```
 ///
 /// The universal rule is that the **highest** value of a field means *not
 /// available* and the one below it means *error*. On top of that, J1939-71
@@ -241,7 +254,7 @@ impl Spn {
 /// top-two rule with no reserved band, since there is no documented one to
 /// apply. Such fields are rare; a 1-bit field is the only case with no room for
 /// status at all, so both its values are measurements.
-const fn classify(raw: u32, bit_length: u16) -> RawValue {
+pub const fn classify(raw: u32, bit_length: u16) -> RawValue {
     match bit_length {
         // No room for status codes.
         1 => RawValue::Valid(raw),

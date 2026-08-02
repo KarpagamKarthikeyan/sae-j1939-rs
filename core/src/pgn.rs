@@ -191,6 +191,13 @@ pub const TP_CM: Pgn = Pgn::new_masked(0x00EC00);
 /// Transport Protocol — Data Transfer (J1939-21): the numbered data packets.
 pub const TP_DT: Pgn = Pgn::new_masked(0x00EB00);
 
+/// Extended Transport Protocol — Connection Management (J1939-21): messages
+/// beyond the 1785 bytes [`TP_CM`] can announce.
+pub const ETP_CM: Pgn = Pgn::new_masked(0x00C800);
+
+/// Extended Transport Protocol — Data Transfer (J1939-21).
+pub const ETP_DT: Pgn = Pgn::new_masked(0x00C700);
+
 /// Address Claimed (J1939-81) — an ECU announcing its NAME and address.
 pub const ADDRESS_CLAIMED: Pgn = Pgn::new_masked(0x00EE00);
 
@@ -223,6 +230,12 @@ pub const DM2: Pgn = Pgn::new_masked(0x00FECB);
 
 /// DM3 (J1939-73) — clear previously active DTCs.
 pub const DM3: Pgn = Pgn::new_masked(0x00FECC);
+
+/// DM11 (J1939-73) — clear active diagnostic trouble codes.
+pub const DM11: Pgn = Pgn::new_masked(0x00FED3);
+
+/// DM13 (J1939-73) — stop/start broadcast, used to quieten the bus.
+pub const DM13: Pgn = Pgn::new_masked(0x00DF00);
 
 /// DM14 (J1939-73) — memory access request.
 pub const DM14: Pgn = Pgn::new_masked(0x00D900);

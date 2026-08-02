@@ -45,13 +45,15 @@ on a microcontroller with no allocator, as well as on a laptop.
 | PGN model with correct PDU1/PDU2 handling, well-known PGN constants | -21 | ✅ |
 | Destination vs. group-extension disambiguation; ECU receive filter | -21 | ✅ |
 | **Transport Protocol: BAM + RTS/CTS/EOM, receive *and* transmit, to 1785 bytes** | -21 | ✅ |
+| **Extended Transport Protocol: up to 117 MB, with Data Packet Offset** | -21 | ✅ ¹ |
 | Concurrent transfers from multiple peers; `T1` session timeouts | -21 | ✅ |
 | Connection abort with the standard reason codes | -21 | ✅ |
 | **Proprietary A and B** manufacturer-specific groups | -21 | ✅ |
 | **NAME** (64-bit ECU identity, all nine fields) | -81 | ✅ |
 | **Address claiming**: contention, defence, relocation, commanded address | -81 | ✅ |
 | **DM1 / DM2**: lamp status + trouble codes (SPN/FMI/occurrence) | -73 | ✅ |
-| **DM3**: clear previously active trouble codes | -73 | ✅ |
+| **DM3 / DM11**: clear previously active and active trouble codes | -73 | ✅ |
+| **DM13**: stop/start broadcast, to quieten a bus for a tool | -73 | ✅ |
 | **`Node`**: one type doing claiming, filtering, reassembly, and dispatch | — | ✅ |
 | **`Outgoing`**: one type choosing single-frame vs BAM vs RTS/CTS on the way out | — | ✅ |
 | **`Ecu`**: `Node` on any `Bus` — clock, BAM pacing, RTS/CTS handshake | — | ✅ |
@@ -60,9 +62,15 @@ on a microcontroller with no allocator, as well as on a laptop.
 | **Request and Acknowledgement** parameter groups | -21 | ✅ |
 | **DM14/DM15/DM16**: memory read, write, and binary data transfer | -73 | ✅ |
 | **Software / ECU / component identification** (`*`-delimited fields) | -71 | ✅ |
-| **ISO 11783 valves**: auxiliary (×16) and general purpose, command/flow/position | ISOBUS | ✅ |
+| **ISO 11783 valves**: auxiliary (×16) and general purpose, command/flow/position | -7 | ✅ |
+| **Working sets**: several ECUs declaring themselves one implement | -7 | ✅ ¹ |
+| **Task controller**: process data — element, DDI, command, value | -10 | ✅ ¹ |
 | **SPN decoding**: bit extraction, scaling, and J1939's status codes | -71 | ✅ |
-| A comprehensive SPN database (only a starter catalogue today) | -71 | planned |
+| **DBC file parsing**: messages, signals, value tables, SPN attributes | -71 | ✅ |
+| Both DBC byte orders (Intel and Motorola bit numbering) | -71 | ✅ |
+
+¹ Implemented and tested, but **not** cross-checked against a reference
+implementation or real hardware — see [Testing & validation](#testing--validation).
 
 Everything in the core is `#![no_std]`, `#![deny(unsafe_code)]`, allocation-free,
 and builds for `thumbv7em-none-eabihf`. Every codec is validated against
@@ -277,9 +285,23 @@ one-byte parameter reading `0xFF` means **not available** and `0xFE` means
 assert_eq!(catalogue::ENGINE_COOLANT_TEMPERATURE.decode(&[0xFF; 8])?, SpnValue::NotAvailable);
 ```
 
-The catalogue is a starter set of widely published parameters, not the full
-J1939-71 database — `Spn::new` and `bit_position` let you transcribe your own
-definitions straight from a datasheet's `byte.bit` notation.
+The catalogue is a starter set, not the full J1939-71 database — that document
+is sold rather than published, and every manufacturer extends it. So bring your
+own: `Spn::new` and `bit_position` transcribe a definition straight from a
+datasheet's `byte.bit` notation, and on the host side `dbc::Dbc` reads the
+**DBC files the industry already uses**, which is usually what you actually have:
+
+```rust
+use sae_j1939_host::dbc::Dbc;
+
+let dbc = Dbc::from_file("j1939.dbc")?;
+let eec1 = dbc.message(Pgn::new(0x00F004)?).expect("EEC1");
+let rpm = eec1.signal("EngineSpeed").unwrap().decode(&frame)?;
+```
+
+Signals loaded at runtime classify J1939's not-available and error codes with
+exactly the same rules as compile-time ones — the reserved ranges belong to the
+standard, not to how the parameter was described.
 
 ### Read diagnostic trouble codes
 
@@ -332,12 +354,21 @@ cargo build -p sae-j1939-rs --target thumbv7em-none-eabihf   # confirm the core 
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-- **Known-good byte vectors.** Every codec asserts against bytes derived from
-  the spec layout, cross-checked with the [Open-SAE-J1939] C reference: the
+- **Known-good byte vectors.** Most codecs assert against bytes derived from
+  the spec layout and cross-checked with the [Open-SAE-J1939] C reference: the
   identifier tests are table-driven over frames that reference builds literally
   (Address Claimed `0x18EEFF..`, TP.CM `0x1CEC....`, Request `0x18EA....`, DM1
   `0x18FECA..`), the NAME test reproduces the reference's bit-packing field by
   field, and the TP.CM control bytes match J1939-21 exactly.
+
+  **Three modules have no such cross-check**, because that reference does not
+  implement them: `etp`, `iso11783::working_set`, and
+  `iso11783::task_controller`. They are built from the J1939-21 and ISO 11783
+  structure alone and have not been run against a real device. They are tested
+  as thoroughly as the rest — a 40 KiB transfer round-trips, every field sweeps
+  its range — but a test can only confirm the layout I implemented, not that the
+  layout is right. Treat them as the least-proven part of the crate, and please
+  report anything that disagrees with your hardware.
 
 - **Nothing on the bus can panic the stack.** `core/tests/robustness.rs` feeds
   arbitrary bytes to every public decoder and to the top-level `Node::on_frame`
@@ -408,11 +439,15 @@ address-claiming state machine — see **[ARCHITECTURE.md](https://github.com/Ka
 |--------|-----------|----------------|
 | `id`, `pgn`, `frame` | -21 | The 29-bit identifier, parameter groups, single frames |
 | `tp` | -21 | Transport protocol: BAM and RTS/CTS, up to 1785 bytes |
+| `etp` | -21 | Extended transport protocol: up to 117 MB |
 | `name` | -81 | The 64-bit ECU NAME |
 | `address_claim` | -81 | Claiming, defending, and relocating an address |
 | `request` | -21 | The Request and Acknowledgement parameter groups |
 | `proprietary` | -21 | Manufacturer-specific Proprietary A and B groups |
-| `iso11783` | ISOBUS | Tractor/implement auxiliary and general purpose valves |
+| `iso11783::valve` | -7 | Tractor/implement auxiliary and general purpose valves |
+| `iso11783::working_set` | -7 | Several ECUs declaring themselves one implement |
+| `iso11783::task_controller` | -10 | Process data: element, DDI, command, value |
+| `dbc` (host) | -71 | Reading signal definitions from a DBC file |
 | `node` | — | A whole ECU: claiming, reassembly, and dispatch in one type |
 | `diagnostics` | -73 | DM1/DM2 trouble codes and lamp status |
 | `memory_access` | -73 | DM14/DM15/DM16 memory read, write, and data transfer |

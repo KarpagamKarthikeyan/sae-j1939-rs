@@ -61,9 +61,11 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use sae_j1939_rs::address_claim::ClaimState;
+use sae_j1939_rs::etp::{self, EtpCm, EtpDt};
 use sae_j1939_rs::frame::Frame;
 use sae_j1939_rs::node::{Event, Node, Outgoing, Progress};
 use sae_j1939_rs::request::Request;
+use sae_j1939_rs::tp::T3_TIMEOUT_MS;
 use sae_j1939_rs::{pgn, Address, Id, Name, Pgn, Priority};
 
 use crate::bus::{Bus, Message};
@@ -94,11 +96,22 @@ pub const CLAIM_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct Ecu<B: Bus, const BUF: usize = 1785, const SESSIONS: usize = 8> {
     bus: B,
     node: Node<BUF, SESSIONS>,
+    /// Extended transport protocol, for messages past 1785 bytes. A host has
+    /// memory to spare, so this is on by default with a generous buffer; an MCU
+    /// driving `Node` directly pays nothing for it.
+    etp: etp::Reassembler<ETP_BUFFER, 2>,
     /// Messages that arrived while we were busy doing something else, so that
     /// nothing is lost during a blocking handshake.
     pending: VecDeque<Message>,
     last_tick: Instant,
 }
+
+/// How large an extended-transport-protocol message an [`Ecu`] will accept.
+///
+/// ETP can carry 117 MB, which no one wants pre-allocated. 64 KiB comfortably
+/// covers an ISOBUS object pool or a task data file, and a transfer larger than
+/// this is refused with an abort rather than being partly accepted.
+pub const ETP_BUFFER: usize = 64 * 1024;
 
 /// An [`Ecu`] on a Linux SocketCAN interface, sized for a host.
 ///
@@ -150,6 +163,7 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
         Ecu {
             bus,
             node: Node::new(name, preferred),
+            etp: etp::Reassembler::new(),
             pending: VecDeque::new(),
             last_tick: Instant::now(),
         }
@@ -210,6 +224,20 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
     /// Where this ECU stands in the address-claiming protocol.
     pub fn claim_state(&self) -> ClaimState {
         self.node.claim_state()
+    }
+
+    /// How far along an extended-transport-protocol transfer from `source` is,
+    /// as `(bytes received, total)`.
+    ///
+    /// An ETP transfer of any size takes a while — a 64 KiB object pool is over
+    /// 9000 frames — so a caller may reasonably want to show progress.
+    pub fn etp_progress(&self, source: Address) -> Option<(u32, u32)> {
+        self.etp.progress(source)
+    }
+
+    /// How many multi-packet transfers the node is reassembling.
+    pub fn transfers_in_flight(&self) -> usize {
+        self.node.transfers_in_flight() + self.etp.active_sessions()
     }
 
     /// Receive the next complete message, or `None` if the bus stayed quiet.
@@ -370,8 +398,78 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
         Ok(message)
     }
 
+    /// Reassemble extended-transport-protocol traffic.
+    ///
+    /// `Node` does not model ETP: its buffers are sized for an MCU, and a
+    /// 117 MB ceiling has no place there. The host layer has memory, so it
+    /// handles ETP itself and hands the finished message back looking like any
+    /// other.
+    ///
+    /// Returns `Ok(None)` for a frame that is not ETP, so the caller can pass it
+    /// on to the node.
+    fn dispatch_etp(&mut self, frame: &Frame) -> io::Result<Option<Option<Message>>> {
+        let group = frame.pgn();
+        if group != pgn::ETP_CM && group != pgn::ETP_DT {
+            return Ok(None);
+        }
+        if !frame.id().is_addressed_to(self.node.address()) {
+            return Ok(Some(None));
+        }
+
+        let source = frame.source_address();
+        let outcome = if group == pgn::ETP_CM {
+            match EtpCm::decode(frame.payload()) {
+                Ok(cm) => self.etp.on_etp_cm(source, &cm),
+                Err(_) => return Ok(Some(None)),
+            }
+        } else {
+            self.etp.on_etp_dt(source, &EtpDt::decode(frame.payload()))
+        };
+
+        // Copy out before the borrow of `self.etp` ends.
+        let (reply, message) = match outcome {
+            etp::Rx::Idle => (None, None),
+            etp::Rx::Send(cm) => (Some(cm), None),
+            etp::Rx::Message {
+                pgn: group,
+                source,
+                data,
+                ack,
+            } => (
+                Some(ack),
+                Some(Message {
+                    pgn: group,
+                    source,
+                    data: data.to_vec(),
+                }),
+            ),
+        };
+
+        if let Some(cm) = reply {
+            self.send_etp_cm(source, &cm)?;
+        }
+        Ok(Some(message))
+    }
+
+    /// An ETP connection-management frame, priority 7 like the ordinary
+    /// transport protocol.
+    fn send_etp_cm(&self, destination: Address, cm: &EtpCm) -> io::Result<()> {
+        let id = Id::from_parts(
+            Priority::LOWEST,
+            pgn::ETP_CM,
+            destination,
+            self.node.address(),
+        )
+        .map_err(invalid_input)?;
+        self.bus.send_frame(&Frame::from_payload(id, cm.encode()))
+    }
+
     /// Feed one frame to the node and send whatever it asks for.
     fn dispatch(&mut self, frame: &Frame) -> io::Result<Option<Message>> {
+        if let Some(message) = self.dispatch_etp(frame)? {
+            return Ok(message);
+        }
+
         let mut outgoing: Vec<Frame> = Vec::new();
         let mut message = None;
 
@@ -431,6 +529,15 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
         self.node.tick(elapsed_ms, |frame| outgoing.push(frame));
         for frame in &outgoing {
             self.bus.send_frame(frame)?;
+        }
+
+        // ETP uses the same T3 timeout as the ordinary protocol's handshake.
+        let mut expired: Vec<(Address, EtpCm)> = Vec::new();
+        self.etp.tick(elapsed_ms, T3_TIMEOUT_MS, |peer, abort| {
+            expired.push((peer, abort))
+        });
+        for (peer, abort) in &expired {
+            self.send_etp_cm(*peer, abort)?;
         }
         Ok(())
     }
@@ -798,6 +905,102 @@ mod tests {
             claims.last().unwrap().id().source_address(),
             Address::new(0x42)
         );
+    }
+
+    /// A 20 KiB transfer is far beyond what the ordinary transport protocol can
+    /// carry, and takes a dozen extended-protocol blocks. The offset arithmetic
+    /// has to hold across every one of them.
+    #[test]
+    fn a_large_message_arrives_over_the_extended_transport_protocol() {
+        use sae_j1939_rs::etp::{self, EtpCm, EtpDt};
+
+        let sender = Address::new(0x00);
+        let payload: Vec<u8> = (0..20_000).map(|i| (i * 31 % 251) as u8).collect();
+
+        let mut ecu = ecu_on(FakeBus::default(), name_for(1, 300));
+        ecu.claim_address().unwrap();
+
+        let mut tx = etp::Transmitter::new(pgn::PROPRIETARY_A, &payload).unwrap();
+        let to_ecu_cm = |cm: &EtpCm| {
+            Frame::from_payload(
+                Id::from_parts(Priority::LOWEST, pgn::ETP_CM, Address::new(0x80), sender).unwrap(),
+                cm.encode(),
+            )
+        };
+        let to_ecu_dt = |dt: &EtpDt| {
+            Frame::from_payload(
+                Id::from_parts(Priority::LOWEST, pgn::ETP_DT, Address::new(0x80), sender).unwrap(),
+                dt.encode(),
+            )
+        };
+
+        // Announce, then drive the blocks until the whole message lands.
+        ecu.bus().queue(to_ecu_cm(&tx.start()));
+        let mut delivered = None;
+        let mut blocks = 0;
+        let mut handled_replies = 0;
+
+        'transfer: for _ in 0..40 {
+            // Anything new the ECU has said drives the next block.
+            let replies = ecu.bus().sent_with_pgn(pgn::ETP_CM);
+            while handled_replies < replies.len() {
+                let cm = EtpCm::decode(replies[handled_replies].payload()).unwrap();
+                handled_replies += 1;
+                if tx.on_etp_cm(&cm) == etp::Tx::SendData {
+                    blocks += 1;
+                    if let Some(dpo) = tx.offset() {
+                        ecu.bus().queue(to_ecu_cm(&dpo));
+                    }
+                    while let Some(packet) = tx.next_packet() {
+                        ecu.bus().queue(to_ecu_dt(&packet));
+                    }
+                }
+            }
+
+            // Pump unconditionally: every frame of a transfer returns None until
+            // the last one, so stopping at the first None would consume one
+            // frame per round.
+            for _ in 0..512 {
+                if let Some(message) = ecu.poll().unwrap() {
+                    if message.pgn == pgn::PROPRIETARY_A {
+                        delivered = Some(message.data);
+                        break 'transfer;
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            delivered.as_deref(),
+            Some(payload.as_slice()),
+            "the whole 20 KiB message must arrive intact"
+        );
+        assert!(blocks > 1, "20 KiB cannot fit one 255-packet block");
+    }
+
+    #[test]
+    fn an_oversized_extended_transfer_is_refused_not_partly_accepted() {
+        use sae_j1939_rs::etp::EtpCm;
+
+        let sender = Address::new(0x00);
+        let mut ecu = ecu_on(FakeBus::default(), name_for(1, 300));
+        ecu.claim_address().unwrap();
+
+        // Larger than ETP_BUFFER.
+        let rts = EtpCm::rts(super::ETP_BUFFER as u32 + 1, pgn::PROPRIETARY_A).unwrap();
+        ecu.bus().queue(Frame::from_payload(
+            Id::from_parts(Priority::LOWEST, pgn::ETP_CM, Address::new(0x80), sender).unwrap(),
+            rts.encode(),
+        ));
+        ecu.poll().unwrap();
+
+        let replies = ecu.bus().sent_with_pgn(pgn::ETP_CM);
+        let last = EtpCm::decode(replies.last().expect("an answer").payload()).unwrap();
+        assert!(
+            matches!(last, EtpCm::Abort { .. }),
+            "an oversized transfer must be refused up front, got {last:?}"
+        );
+        assert_eq!(ecu.etp_progress(sender), None);
     }
 
     #[test]

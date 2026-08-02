@@ -7,13 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `dbc` (host) — read signal definitions from a **DBC file**, the format the
+  industry already uses to describe CAN signals. This answers the "comprehensive
+  SPN database" question without shipping thousands of values that cannot be
+  checked against a document sold rather than published: the database is the
+  user's, current, and specific to their hardware.
+  - `BO_` messages map to a `Pgn`; `SG_` signals carry geometry, scaling, sign,
+    and unit. Sections the module does not model — node lists, comments,
+    attributes, value tables — are skipped, so a real manufacturer file parses.
+  - Signals decode through the core's reserved-range rules, so a runtime-loaded
+    parameter reports *not available* and *error* exactly like a compile-time
+    one.
+  - Both byte orders decode. J1939 is little-endian, but real files mix in
+    Motorola signals, which use a different bit numbering — walking down within
+    a byte, then jumping to the top of the next.
+  - `VAL_` value tables name enumerated values, so a decoder reports
+    `"Amber Warning"` rather than `2`; `Signal::describe` prefers the name and
+    falls back to the scaled measurement with its unit.
+  - `BA_ "SPN"` attributes attach the SPN number to its signal, so a tool can
+    speak the same language as the standard. Tables and attributes naming
+    signals the file never defined are ignored rather than failing the parse.
+- `spn::classify` is now public, so a definition from any source can reuse
+  J1939's reserved-range rules instead of reimplementing them.
+- `etp` — the **Extended Transport Protocol**, for messages past the 1785-byte
+  ceiling `tp` imposes. Carries up to 117,440,505 bytes. ISOBUS object pools and
+  task data routinely exceed 1785 bytes, so this was the gap that stopped the
+  crate being usable for that work at all.
+  - A data packet's sequence number is still one byte, so the sender precedes
+    each block with a **Data Packet Offset** and the sequence numbers that
+    follow are relative to it. A receiver that ignores the offset writes every
+    block over the first, so the reassembler refuses data that arrives without
+    one, and refuses an offset that does not match the block it granted.
+  - `Reassembler<BUF, SESSIONS>` and `Transmitter`, matching `tp`'s shape.
+    `progress` reports bytes received against the total, because these transfers
+    take long enough to be worth showing.
+  - **Unverified against hardware.** Every other wire format here was
+    cross-checked against the Open-SAE-J1939 C implementation; that project does
+    not cover ETP, so this is built from the J1939-21 and ISO 11783-3 structure
+    alone. It is the least-proven part of the crate.
+- `Ecu` reassembles ETP transfers up to `ETP_BUFFER` (64 KiB) and expires stalled
+  ones on `T3`. `Node` deliberately does not: a 117 MB ceiling has no place on an
+  MCU, and a host has the memory to spare.
+- `pgn::ETP_CM` and `pgn::ETP_DT`.
+
+- `diagnostics::dm11` — clear *active* trouble codes, the counterpart to `dm3`.
+  Documented with why that is rarely the right thing to do: an active code is a
+  fault happening now, and clearing it destroys evidence without fixing
+  anything.
+- `diagnostics::Dm13` — stop/start broadcast, for quietening a bus so a tool can
+  work. Every network defaults to "do not care", so a command aimed at one bus
+  cannot silence the others by omission.
+- `pgn::DM11` and `pgn::DM13`.
+
+- `iso11783` became a directory module as it grew: `valve` (the existing
+  hydraulics), plus `working_set` and `task_controller`. Every previous path
+  still resolves — the valve API is re-exported at `iso11783::*`.
+- `iso11783::working_set` — a seed drill is three ECUs that a task controller
+  must see as one implement. `WorkingSetMaster` declares how many. A count of
+  zero is refused: the master is itself a member, so zero is malformed rather
+  than "no members".
+- `iso11783::task_controller` — ISO 11783-10 process data, the one parameter
+  group a task controller and an implement use for everything. `ProcessData`
+  carries an element (12 bits, split awkwardly across two bytes), a DDI, a
+  command, and a signed 32-bit value. `Command::is_measurement_trigger`
+  distinguishes the five commands that set up reporting from those that ask
+  once — the reason a task controller does not have to poll.
+- `DeviceDescriptor::needs_extended_transport` — an implement's object pool runs
+  to tens of kilobytes, which is the practical reason ISOBUS needs `etp` at all.
+  Tested end to end: a 40 KiB pool crosses the bus and arrives intact.
+- **Neither is cross-checked against hardware.** The Open-SAE-J1939 C reference
+  does not cover working sets or the task controller, so both are built from the
+  ISO 11783 structure alone, as `etp` is.
+
 ### Planned
 
-- A comprehensive SPN database. The decoding machinery and a starter catalogue
-  ship in 0.1; how a full parameter list should be carried in a `no_std` crate
-  is still open (feature-gated static, build-time generation, or a companion
-  crate).
-- More of ISO 11783 beyond the valve groups (task controller, virtual terminal).
+- The ISO 11783-6 virtual terminal (an object-pool protocol in its own right).
 
 ## [0.2.0] - 2026-08-01
 
