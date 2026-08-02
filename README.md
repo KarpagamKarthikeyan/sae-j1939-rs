@@ -11,7 +11,7 @@ on a bare-metal ECU *and* on a host (Linux/SocketCAN).
 J1939 is the CAN-based protocol behind heavy vehicles: trucks, agricultural and
 construction equipment, and marine engines.
 
-> **Status: early development (0.2).** The API will change. The J1939-21 data
+> **Status: early development (0.3).** The API will change. The J1939-21 data
 > link and transport layers, J1939-81 network management, J1939-73 diagnostics,
 > the J1939-71 identification groups, and the ISO 11783 valve groups are
 > implemented and tested — see below.
@@ -80,12 +80,12 @@ known-good byte sequences — see [Testing & validation](#testing--validation).
 
 ```toml
 [dependencies]
-sae-j1939-rs = "0.2"      # no_std core: identifiers, PGNs, transport protocol, NAME, diagnostics
-sae-j1939-host = "0.2"    # std host layer: Ecu, Bus, SocketCAN transport
+sae-j1939-rs = "0.3"      # no_std core: identifiers, PGNs, transport protocol, NAME, diagnostics
+sae-j1939-host = "0.3"    # std host layer: Ecu, Bus, SocketCAN transport
 ```
 
 The core is `no_std` by default; enable `std` for `std::error::Error` impls
-(`sae-j1939-rs = { version = "0.2", features = ["std"] }`). On a microcontroller,
+(`sae-j1939-rs = { version = "0.3", features = ["std"] }`). On a microcontroller,
 depend only on `sae-j1939-rs` and drive it with your HAL's [`embedded-can`]
 implementation — no host crate needed. In `sae-j1939-host`, the SocketCAN
 transport is compiled only on Linux. **MSRV: Rust 1.75.**

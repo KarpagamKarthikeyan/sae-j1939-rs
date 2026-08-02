@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.3.0] - 2026-08-02
+
+Additive throughout: no breaking changes since 0.2.0.
+
 ### Added
 
 - `dbc` (host) — read signal definitions from a **DBC file**, the format the
@@ -299,7 +305,8 @@ peer belonged to the transfer in hand.
   (including a licensing-provenance checkbox), and CI covering tests, lint,
   docs, `no_std`, MSRV 1.75, and an on-bus decode.
 
-[Unreleased]: https://github.com/KarpagamKarthikeyan/sae-j1939-rs/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/KarpagamKarthikeyan/sae-j1939-rs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/KarpagamKarthikeyan/sae-j1939-rs/compare/v0.2.0...v0.3.0
 [0.1.0]: https://github.com/KarpagamKarthikeyan/sae-j1939-rs/releases/tag/v0.1.0
 
 ## [0.1.0] - 2026-07-31
