@@ -61,6 +61,13 @@ impl core::fmt::Display for Pgn {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for Pgn {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(f, "{=u32:#08x}", self.0)
+    }
+}
+
 impl core::fmt::Debug for Pgn {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "Pgn({:#08X})", self.0)
@@ -231,11 +238,33 @@ pub const DM2: Pgn = Pgn::new_masked(0x00FECB);
 /// DM3 (J1939-73) — clear previously active DTCs.
 pub const DM3: Pgn = Pgn::new_masked(0x00FECC);
 
+/// DM4 (J1939-73) — freeze frame parameters: the conditions when a fault set.
+///
+/// The PGN only. The freeze frame payload is a variable-length structure whose
+/// contents depend on the ECU, and this crate does not model it — see the
+/// [`diagnostics`](crate::diagnostics) module documentation.
+pub const DM4: Pgn = Pgn::new_masked(0x00FECD);
+
+/// DM5 (J1939-73) — diagnostic readiness: fault counts and monitor status.
+pub const DM5: Pgn = Pgn::new_masked(0x00FECE);
+
+/// DM6 (J1939-73) — pending diagnostic trouble codes.
+pub const DM6: Pgn = Pgn::new_masked(0x00FECF);
+
 /// DM11 (J1939-73) — clear active diagnostic trouble codes.
 pub const DM11: Pgn = Pgn::new_masked(0x00FED3);
 
+/// DM12 (J1939-73) — emissions-related active diagnostic trouble codes.
+pub const DM12: Pgn = Pgn::new_masked(0x00FED4);
+
 /// DM13 (J1939-73) — stop/start broadcast, used to quieten the bus.
 pub const DM13: Pgn = Pgn::new_masked(0x00DF00);
+
+/// DM23 (J1939-73) — previously active emissions-related trouble codes.
+pub const DM23: Pgn = Pgn::new_masked(0x00FDB5);
+
+/// DM27 (J1939-73) — all pending diagnostic trouble codes.
+pub const DM27: Pgn = Pgn::new_masked(0x00FD82);
 
 /// DM14 (J1939-73) — memory access request.
 pub const DM14: Pgn = Pgn::new_masked(0x00D900);

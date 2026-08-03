@@ -82,6 +82,7 @@ pub const LIMIT_NOT_USED: u8 = 0x7;
 const FILL: u8 = 0xFF;
 
 /// What a hydraulic valve is doing, or being told to do.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ValveState {
     /// Holding position.
@@ -135,6 +136,7 @@ impl ValveState {
 }
 
 /// What the valve should do if communication is lost.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FailSafeMode {
     /// Block the valve, holding its current position.
@@ -167,6 +169,7 @@ impl FailSafeMode {
 }
 
 /// One of the sixteen auxiliary valves, and the PGNs that address it.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ValveNumber(u8);
 
@@ -250,6 +253,7 @@ const fn pack_mode_and_state(fail_safe_mode: FailSafeMode, valve_state: ValveSta
 /// byte 2    fail-safe mode (2 bits) | reserved (2) | valve state (4)
 /// bytes 3-7 reserved
 /// ```
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AuxiliaryValveCommand {
     /// Commanded flow as a percentage of the valve's standard flow.
@@ -294,6 +298,7 @@ impl AuxiliaryValveCommand {
 /// byte 3    limit (top 3 bits)
 /// bytes 4-7 reserved
 /// ```
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuxiliaryValveEstimatedFlow {
     /// Estimated flow while extending, percent.
@@ -356,6 +361,7 @@ impl AuxiliaryValveEstimatedFlow {
 /// bytes 3-4 measured position, micrometres, little-endian
 /// bytes 5-7 reserved
 /// ```
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AuxiliaryValveMeasuredPosition {
     /// Position as a percentage of travel.
@@ -395,6 +401,7 @@ impl AuxiliaryValveMeasuredPosition {
 ///
 /// Like [`AuxiliaryValveCommand`], but with an extra 16-bit extended flow field
 /// for finer control.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GeneralPurposeValveCommand {
     /// Commanded flow as a percentage of standard flow.
@@ -437,6 +444,7 @@ impl GeneralPurposeValveCommand {
 ///
 /// Carries both the percentage figures of an auxiliary valve and 16-bit
 /// extended values, filling all eight bytes.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GeneralPurposeValveEstimatedFlow {
     /// Estimated flow while extending, percent.

@@ -14,6 +14,13 @@ pub use sae_j1939_rs;
 /// The transport boundary: what an [`ecu::Ecu`] needs from a CAN bus.
 pub mod bus;
 
+/// Reading `candump` captures, and replaying them through the stack.
+///
+/// The way to check this crate against a real bus without needing one: capture
+/// once with `candump -l`, then replay offline as often as you like.
+/// Cross-platform — a capture is text.
+pub mod log;
+
 /// Reading signal definitions from a DBC file.
 ///
 /// The industry-standard way to describe CAN signals, so the parameter database

@@ -1,12 +1,16 @@
 // Copyright (c) 2026 Karpagam Karthikeyan
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! J1939-73 diagnostics: DM1 and DM2 trouble codes.
+//! J1939-73 diagnostics: trouble codes, lamps, and readiness.
 //!
 //! **DM1** (PGN `0x00FECA`) reports the faults an ECU currently has active;
 //! **DM2** (PGN `0x00FECB`) reports faults that were active previously. Both
 //! share a layout: two bytes of lamp status followed by a list of Diagnostic
 //! Trouble Codes, four bytes each.
+//!
+//! So do four more, which differ only in *which* faults they list — pending,
+//! emissions-related, and so on. [`Message`] parses all six; [`is_dtc_list`]
+//! says which parameter groups they are.
 //!
 //! ```text
 //! byte 0   lamp status        MIL | red stop | amber warning | protect  (2 bits each)
@@ -39,8 +43,47 @@
 //! ```
 
 use crate::pgn;
+use crate::pgn::Pgn;
 use crate::request::{AckControl, Acknowledgement, Request};
 use crate::types::{Address, Error, Result};
+
+/// The parameter groups that carry lamp status followed by a trouble-code list.
+///
+/// They differ only in which faults they report, not in how they report them,
+/// so one codec reads all six.
+///
+/// | PGN | What it lists |
+/// |-----|---------------|
+/// | DM1 | active faults |
+/// | DM2 | previously active faults |
+/// | DM6 | pending faults — seen once, not yet confirmed |
+/// | DM12 | emissions-related active faults |
+/// | DM23 | previously active emissions-related faults |
+/// | DM27 | all pending faults |
+pub const DTC_LIST_GROUPS: [Pgn; 6] = [
+    pgn::DM1,
+    pgn::DM2,
+    pgn::DM6,
+    pgn::DM12,
+    pgn::DM23,
+    pgn::DM27,
+];
+
+/// Whether a parameter group carries a lamp-status-and-trouble-code list, and
+/// so can be read with [`Message::parse`].
+///
+/// ```
+/// use sae_j1939_rs::diagnostics::is_dtc_list;
+/// use sae_j1939_rs::pgn;
+///
+/// assert!(is_dtc_list(pgn::DM1));
+/// assert!(is_dtc_list(pgn::DM12));   // emissions-related, same layout
+/// assert!(!is_dtc_list(pgn::DM5));   // readiness counts, a different shape
+/// assert!(!is_dtc_list(pgn::DM3));   // a command, with no payload of its own
+/// ```
+pub fn is_dtc_list(pgn: Pgn) -> bool {
+    DTC_LIST_GROUPS.contains(&pgn)
+}
 
 /// Bytes each Diagnostic Trouble Code occupies.
 pub const DTC_LEN: usize = 4;
@@ -59,6 +102,7 @@ pub const MAX_FMI: u8 = 0x1F;
 pub const MAX_OCCURRENCE_COUNT: u8 = 0x7F;
 
 /// The four lamps a diagnostic message reports on.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Lamp {
     /// Malfunction Indicator Lamp — an emissions-related fault.
@@ -92,6 +136,7 @@ impl Lamp {
 }
 
 /// The state of one lamp: a two-bit field.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LampStatus {
     /// The lamp is off.
@@ -129,6 +174,7 @@ impl LampStatus {
 ///
 /// Each of the four lamps has a *status* (on/off) and a *flash status*
 /// describing how it should blink.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Lamps {
     status: u8,
@@ -233,6 +279,23 @@ impl core::fmt::Display for Dtc {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for Dtc {
+    fn format(&self, f: defmt::Formatter) {
+        if self.is_no_fault() {
+            defmt::write!(f, "no active fault")
+        } else {
+            defmt::write!(
+                f,
+                "SPN {=u32} FMI {=u8} (x{=u8})",
+                self.spn,
+                self.fmi,
+                self.occurrence_count
+            )
+        }
+    }
+}
+
 impl core::fmt::Debug for Dtc {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "Dtc({self}")?;
@@ -293,6 +356,7 @@ impl Dtc {
 /// The same type covers a single CAN frame and a transport-protocol
 /// reassembly, because the layout is identical — only the number of trouble
 /// codes differs.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Message<'a> {
     lamps: Lamps,
@@ -526,6 +590,7 @@ pub mod dm11 {
 /// interlock — a tool that crashes must not leave the vehicle silent. This type
 /// encodes the messages; the repetition is the caller's, since the state
 /// machines own no clock.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Dm13 {
     /// Byte 0: two bits per network, in [`Network`] order.
@@ -537,6 +602,7 @@ pub struct Dm13 {
 /// Which network a [`Dm13`] command applies to.
 ///
 /// The four J1939-73 names the payload's first byte carries, in order.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Network {
     /// The current data link the message arrived on.
@@ -569,6 +635,7 @@ impl Network {
 }
 
 /// What a [`Dm13`] asks a network to do.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BroadcastCommand {
     /// Stop broadcasting.
@@ -655,6 +722,148 @@ impl Dm13 {
         Dm13 {
             networks: data[0],
             hold: data[1],
+        }
+    }
+}
+
+/// How thoroughly an ECU claims to meet on-board diagnostic regulations.
+///
+/// J1939-73 numbers a range of compliance levels. Only the two whose meaning is
+/// unambiguous are named here; the rest are carried through as [`ObdCompliance::Other`]
+/// rather than guessed at, since misreporting an emissions compliance level is
+/// worse than reporting a number.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObdCompliance {
+    /// The ECU is not intended to meet OBD requirements.
+    NotIntended,
+    /// The ECU does not report a compliance level.
+    NotAvailable,
+    /// A level defined by J1939-73 and carried through unmodified. Look it up
+    /// in the standard rather than trusting an interpretation here.
+    Other(u8),
+}
+
+impl ObdCompliance {
+    /// The wire byte.
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            ObdCompliance::NotIntended => 5,
+            ObdCompliance::NotAvailable => 0xFF,
+            ObdCompliance::Other(raw) => raw,
+        }
+    }
+
+    /// Decode a wire byte.
+    pub const fn from_u8(raw: u8) -> Self {
+        match raw {
+            5 => ObdCompliance::NotIntended,
+            0xFF => ObdCompliance::NotAvailable,
+            other => ObdCompliance::Other(other),
+        }
+    }
+}
+
+/// DM5 — diagnostic readiness (PGN `0x00FECE`).
+///
+/// How many faults an ECU is holding, and how far through its self-tests it is.
+/// A service tool reads this first: the counts say whether to bother asking for
+/// [`DM1`](crate::pgn::DM1) at all.
+///
+/// ```text
+/// byte 0    active fault count
+/// byte 1    previously active fault count
+/// byte 2    OBD compliance level
+/// bytes 3-7 monitor support and completion bitfields
+/// ```
+///
+/// # The monitor bytes are not decoded
+///
+/// Bytes 3–7 say which self-tests an ECU supports and which have completed this
+/// drive cycle. Their bit assignments are specific and this crate does not model
+/// them — a wrong reading would say a catalyst monitor had passed when it had
+/// not. [`Dm5::monitors`] hands back the raw bytes so a caller with the standard
+/// to hand can interpret them.
+///
+/// ```
+/// use sae_j1939_rs::diagnostics::{Dm5, ObdCompliance};
+///
+/// let readiness = Dm5::decode(&[2, 5, 0xFF, 0, 0, 0, 0, 0]);
+/// assert_eq!(readiness.active_faults, 2);
+/// assert_eq!(readiness.previously_active_faults, 5);
+/// assert_eq!(readiness.obd_compliance, ObdCompliance::NotAvailable);
+/// assert!(readiness.has_active_faults());
+/// ```
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dm5 {
+    /// How many faults are active now.
+    pub active_faults: u8,
+    /// How many were active previously.
+    pub previously_active_faults: u8,
+    /// The compliance level the ECU claims.
+    pub obd_compliance: ObdCompliance,
+    /// Monitor support and completion, undecoded — see the type documentation.
+    monitors: [u8; 5],
+}
+
+impl Dm5 {
+    /// Report fault counts and a compliance level, with no monitor data.
+    pub const fn new(
+        active_faults: u8,
+        previously_active_faults: u8,
+        obd_compliance: ObdCompliance,
+    ) -> Self {
+        Dm5 {
+            active_faults,
+            previously_active_faults,
+            obd_compliance,
+            monitors: [0xFF; 5],
+        }
+    }
+
+    /// The raw monitor support and completion bytes.
+    ///
+    /// Deliberately not decoded: see the type documentation.
+    pub const fn monitors(&self) -> &[u8; 5] {
+        &self.monitors
+    }
+
+    /// Set the monitor bytes verbatim.
+    #[must_use]
+    pub const fn with_monitors(mut self, monitors: [u8; 5]) -> Self {
+        self.monitors = monitors;
+        self
+    }
+
+    /// Whether this ECU is currently holding a fault.
+    ///
+    /// The question a tool asks before requesting the codes themselves.
+    pub const fn has_active_faults(&self) -> bool {
+        self.active_faults > 0
+    }
+
+    /// Encode to the eight-byte payload.
+    pub const fn encode(&self) -> [u8; 8] {
+        [
+            self.active_faults,
+            self.previously_active_faults,
+            self.obd_compliance.as_u8(),
+            self.monitors[0],
+            self.monitors[1],
+            self.monitors[2],
+            self.monitors[3],
+            self.monitors[4],
+        ]
+    }
+
+    /// Decode an eight-byte payload.
+    pub const fn decode(data: &[u8; 8]) -> Self {
+        Dm5 {
+            active_faults: data[0],
+            previously_active_faults: data[1],
+            obd_compliance: ObdCompliance::from_u8(data[2]),
+            monitors: [data[3], data[4], data[5], data[6], data[7]],
         }
     }
 }
@@ -757,6 +966,127 @@ mod tests {
         assert_eq!(&bytes[2..], &[0xFF; 6], "the tail is reserved filler");
         assert_eq!(Dm13::decode(&bytes), message);
         assert_eq!(Dm13::decode(&bytes).hold_signal(), 0x00);
+    }
+
+    /// The six groups differ in *which* faults they list, not in how, so the
+    /// codec verified against the C reference for DM1 reads all of them.
+    #[test]
+    fn every_dtc_list_group_parses_with_the_same_codec() {
+        let lamps = Lamps::new().with_status(Lamp::AmberWarning, LampStatus::On);
+        let faults = [Dtc::new(299, 4, 3).unwrap(), Dtc::new(100, 1, 7).unwrap()];
+        let mut payload = [0u8; 32];
+        let len = encode(lamps, &faults, &mut payload).unwrap();
+
+        for group in DTC_LIST_GROUPS {
+            assert!(is_dtc_list(group), "{group:?} should be a DTC list");
+            let message = Message::parse(&payload[..len]).unwrap();
+            assert_eq!(message.lamps(), lamps, "{group:?}");
+            assert_eq!(
+                message.dtcs().collect::<std::vec::Vec<_>>(),
+                faults,
+                "{group:?}"
+            );
+        }
+
+        // Groups that are a command or a different shape are not in the family.
+        for other in [pgn::DM3, pgn::DM5, pgn::DM11, pgn::DM13, pgn::DM14] {
+            assert!(!is_dtc_list(other), "{other:?} is not a DTC list");
+        }
+    }
+
+    #[test]
+    fn the_dtc_list_groups_are_the_pgns_they_claim_to_be() {
+        // A wrong PGN here would silently ask an ECU for the wrong fault set.
+        assert_eq!(pgn::DM6.as_u32(), 0x00FECF, "pending");
+        assert_eq!(pgn::DM12.as_u32(), 0x00FED4, "emissions-related active");
+        assert_eq!(pgn::DM23.as_u32(), 0x00FDB5, "previously active emissions");
+        assert_eq!(pgn::DM27.as_u32(), 0x00FD82, "all pending");
+        assert_eq!(pgn::DM4.as_u32(), 0x00FECD, "freeze frame");
+        assert_eq!(pgn::DM5.as_u32(), 0x00FECE, "readiness");
+
+        // DM1..DM6 run consecutively, which is a useful sanity check on all six.
+        let sequence = [pgn::DM1, pgn::DM2, pgn::DM3, pgn::DM4, pgn::DM5, pgn::DM6];
+        for pair in sequence.windows(2) {
+            assert_eq!(
+                pair[1].as_u32(),
+                pair[0].as_u32() + 1,
+                "{:?} should follow {:?}",
+                pair[1],
+                pair[0]
+            );
+        }
+
+        // All six are distinct.
+        for (i, a) in DTC_LIST_GROUPS.iter().enumerate() {
+            for b in DTC_LIST_GROUPS.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn dm5_reports_counts_and_compliance() {
+        let readiness = Dm5::new(2, 5, ObdCompliance::NotIntended).with_monitors([1, 2, 3, 4, 5]);
+        let bytes = readiness.encode();
+        assert_eq!(bytes[0], 2);
+        assert_eq!(bytes[1], 5);
+        assert_eq!(bytes[2], 5, "NotIntended is compliance level 5");
+        assert_eq!(&bytes[3..], &[1, 2, 3, 4, 5]);
+        assert_eq!(Dm5::decode(&bytes), readiness);
+        assert!(readiness.has_active_faults());
+
+        // The question a tool asks before requesting the codes at all.
+        assert!(!Dm5::new(0, 9, ObdCompliance::NotAvailable).has_active_faults());
+    }
+
+    #[test]
+    fn dm5_carries_unknown_compliance_levels_through_unchanged() {
+        // Misreporting a compliance level is worse than reporting a number, so
+        // anything not unambiguous is passed along verbatim.
+        for raw in 0..=255u8 {
+            let decoded = ObdCompliance::from_u8(raw);
+            assert_eq!(decoded.as_u8(), raw, "level {raw} must round-trip");
+        }
+        assert_eq!(ObdCompliance::from_u8(5), ObdCompliance::NotIntended);
+        assert_eq!(ObdCompliance::from_u8(0xFF), ObdCompliance::NotAvailable);
+        assert_eq!(ObdCompliance::from_u8(3), ObdCompliance::Other(3));
+    }
+
+    #[test]
+    fn dm5_monitor_bytes_are_passed_through_untouched() {
+        // They are not decoded, so they must at least survive intact — a wrong
+        // reading would claim a monitor had passed when it had not.
+        for pattern in [[0u8; 5], [0xFF; 5], [0xAA, 0x55, 0x00, 0xFF, 0x0F]] {
+            let readiness = Dm5::new(0, 0, ObdCompliance::NotAvailable).with_monitors(pattern);
+            assert_eq!(Dm5::decode(&readiness.encode()).monitors(), &pattern);
+        }
+    }
+
+    /// The realistic exchange: read readiness, and only ask for codes if there
+    /// are any.
+    #[test]
+    fn a_tool_reads_readiness_before_asking_for_codes() {
+        let quiet = Dm5::decode(&[0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(!quiet.has_active_faults(), "nothing to ask for");
+
+        let faulted = Dm5::decode(&[3, 1, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(faulted.has_active_faults());
+        assert_eq!(faulted.active_faults, 3);
+
+        // Three active faults will not fit one frame, so the DM1 answering this
+        // arrives over the transport protocol.
+        let faults = [
+            Dtc::new(100, 1, 2).unwrap(),
+            Dtc::new(110, 0, 5).unwrap(),
+            Dtc::new(1569, 31, 126).unwrap(),
+        ];
+        let mut payload = [0u8; 32];
+        let len = encode(Lamps::new(), &faults, &mut payload).unwrap();
+        assert!(len > 8, "three codes exceed a single frame");
+        assert_eq!(
+            Message::parse(&payload[..len]).unwrap().dtc_count(),
+            faulted.active_faults as usize
+        );
     }
 
     #[test]

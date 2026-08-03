@@ -7,7 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- `log` (host) — read `candump` captures and replay them through the stack.
+  Three modules (`etp`, `iso11783::working_set`, `iso11783::task_controller`)
+  have no reference implementation to check against, and tests can only prove
+  they are self-consistent. Replaying a real capture is how anyone with hardware
+  can tell us whether they are *right*, and it needs no CAN interface, no Linux,
+  and no second machine.
+  - `parse_line` handles the `candump -l` format. Traffic the stack cannot use —
+    11-bit identifiers from a CANopen device sharing the bus, remote frames,
+    CAN FD — is skipped rather than rejected, so a mixed capture replays without
+    being edited first.
+  - `Replay` drives `Node::tick` from the **capture's own timestamps**, so a
+    transfer that stalled on the real bus stalls here at the same point and a
+    session that timed out times out. Only possible because the state machines
+    own no clock.
+  - `Replay::claimed_addresses` reports the bus inventory. Address claims are
+    network management, so a node consumes them and they never surface as
+    messages — but "who is on this bus" is the first thing a capture is opened
+    to answer.
+  - `Replay::transmitted` records what the node would have sent, so a capture's
+    own responses can be compared against what this stack would have replied.
+- `replay` example — a working analyser: reassembles, decodes parameters into
+  engineering units, reads trouble codes, and prints a bus inventory.
+  Cross-platform, since a capture is text.
+- Four more trouble-code lists: **DM6** (pending), **DM12** (emissions-related
+  active), **DM23** (previously active emissions-related), **DM27** (all
+  pending). They differ from DM1 and DM2 only in *which* faults they report, not
+  in how, so `Message` reads all six — this extends a codec already cross-checked
+  against the C reference rather than adding another unverified one.
+  `is_dtc_list` and `DTC_LIST_GROUPS` say which parameter groups they are.
+- **DM5** — diagnostic readiness: active and previously active fault counts, and
+  the OBD compliance level. A tool reads this first, since the counts say whether
+  to ask for DM1 at all.
+  - The five monitor bytes are **not decoded**. Their bit assignments are
+    specific, and a wrong reading would report a catalyst monitor as passed when
+    it had not; `monitors()` returns them raw for a caller with the standard.
+  - Compliance levels other than the two unambiguous ones are carried through as
+    `ObdCompliance::Other` rather than guessed at.
+- `pgn::DM4` — the freeze-frame PGN only. The payload is a variable-length,
+  ECU-specific structure this crate does not model, and the constant says so.
+- The `replay` example recognises all of them.
+
+- A **`defmt`** feature on the core crate, off by default. Embedded Rust logs
+  with `defmt`, and without `defmt::Format` these types could not be printed on
+  a microcontroller at all — the audience the crate is aimed at.
+  - Derived on the plain types; hand-written for the seven with custom `Debug`
+    (`Id`, `Pgn`, `Address`, `Priority`, `Frame`, `Name`, `Dtc`), so a `defmt`
+    log line and a host `Debug` line say the same thing.
+  - `Frame` logs in `candump` form, so a frame captured from an MCU replays with
+    `cansend` exactly as one from a host does.
+- `tools/check.sh` and CI now walk the **feature matrix** rather than relying on
+  `--all-features`, which enables everything at once and so cannot catch a
+  feature that breaks only in isolation. Verified by breaking the `defmt` path
+  alone: a plain build still passed, and the gate failed.
 
 ## [0.3.0] - 2026-08-02
 

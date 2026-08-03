@@ -47,6 +47,15 @@ impl core::fmt::Display for Frame {
     }
 }
 
+/// The `candump` form, so a frame logged from an MCU can be replayed with
+/// `cansend` exactly as one logged from a host can.
+#[cfg(feature = "defmt")]
+impl defmt::Format for Frame {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(f, "{=u32:08X}#{=[u8]:02X}", self.id.as_u32(), self.data());
+    }
+}
+
 impl core::fmt::Debug for Frame {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "Frame({self})")

@@ -9,6 +9,7 @@ use core::fmt;
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// An error produced by the J1939 codecs.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
@@ -115,6 +116,18 @@ impl fmt::Display for Address {
     }
 }
 
+/// Mirrors the `Display` form, so a log line and a panic message agree.
+#[cfg(feature = "defmt")]
+impl defmt::Format for Address {
+    fn format(&self, f: defmt::Formatter) {
+        match self.0 {
+            0xFF => defmt::write!(f, "{=u8:#04x} (global)", self.0),
+            0xFE => defmt::write!(f, "{=u8:#04x} (null)", self.0),
+            _ => defmt::write!(f, "{=u8:#04x}", self.0),
+        }
+    }
+}
+
 impl fmt::Debug for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Address({:#04X}", self.0)?;
@@ -190,6 +203,13 @@ pub struct Priority(u8);
 impl fmt::Display for Priority {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for Priority {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(f, "{=u8}", self.0)
     }
 }
 

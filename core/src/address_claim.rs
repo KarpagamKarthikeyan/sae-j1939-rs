@@ -52,6 +52,7 @@ pub const DYNAMIC_ADDRESS_END: u8 = 247;
 pub const COMMANDED_ADDRESS_LEN: usize = 9;
 
 /// Where an ECU stands in the address-claiming protocol.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimState {
     /// No claim has been made yet.
@@ -70,6 +71,7 @@ pub enum ClaimState {
 /// A claim whose `source` is [`Address::NULL`] is the *Cannot Claim Address*
 /// message — the same PGN, sent from `0xFE`, telling the bus this ECU has given
 /// up.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Claim {
     /// The address being claimed, or [`Address::NULL`] for Cannot Claim.
@@ -91,6 +93,7 @@ impl Claim {
 }
 
 /// What the caller should put on the bus after an event.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimAction {
     /// Nothing to do.
@@ -101,6 +104,7 @@ pub enum ClaimAction {
 }
 
 /// The J1939-81 address claiming state machine for one ECU.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone)]
 pub struct AddressClaimer {
     name: Name,

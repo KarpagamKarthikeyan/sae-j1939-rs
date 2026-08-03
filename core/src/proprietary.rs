@@ -43,6 +43,7 @@ use crate::types::{Address, Priority, Result};
 /// Identified by its group extension: `ProprietaryB::new(0x42)` is PGN
 /// `0x00FF42`. Because the type can only name PGNs inside the reserved range,
 /// it is impossible to accidentally collide with a standard parameter group.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProprietaryB {
     group_extension: u8,

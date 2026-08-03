@@ -51,7 +51,8 @@ on a microcontroller with no allocator, as well as on a laptop.
 | **Proprietary A and B** manufacturer-specific groups | -21 | ✅ |
 | **NAME** (64-bit ECU identity, all nine fields) | -81 | ✅ |
 | **Address claiming**: contention, defence, relocation, commanded address | -81 | ✅ |
-| **DM1 / DM2**: lamp status + trouble codes (SPN/FMI/occurrence) | -73 | ✅ |
+| **DM1 / DM2 / DM6 / DM12 / DM23 / DM27**: six fault lists, one codec | -73 | ✅ |
+| **DM5**: readiness — fault counts and compliance level | -73 | ✅ |
 | **DM3 / DM11**: clear previously active and active trouble codes | -73 | ✅ |
 | **DM13**: stop/start broadcast, to quieten a bus for a tool | -73 | ✅ |
 | **`Node`**: one type doing claiming, filtering, reassembly, and dispatch | — | ✅ |
@@ -67,10 +68,15 @@ on a microcontroller with no allocator, as well as on a laptop.
 | **Task controller**: process data — element, DDI, command, value | -10 | ✅ ¹ |
 | **SPN decoding**: bit extraction, scaling, and J1939's status codes | -71 | ✅ |
 | **DBC file parsing**: messages, signals, value tables, SPN attributes | -71 | ✅ |
+| **`candump` capture replay**: analyse a real bus offline, on any platform | — | ✅ |
+| **`defmt` logging** on the public types, for microcontrollers | — | ✅ |
 | Both DBC byte orders (Intel and Motorola bit numbering) | -71 | ✅ |
 
 ¹ Implemented and tested, but **not** cross-checked against a reference
 implementation or real hardware — see [Testing & validation](#testing--validation).
+If you have a capture containing any of them, `cargo run -p sae-j1939-host
+--example replay -- yourcapture.log` is the quickest way to tell us whether we
+got it right.
 
 Everything in the core is `#![no_std]`, `#![deny(unsafe_code)]`, allocation-free,
 and builds for `thumbv7em-none-eabihf`. Every codec is validated against
@@ -83,6 +89,13 @@ known-good byte sequences — see [Testing & validation](#testing--validation).
 sae-j1939-rs = "0.3"      # no_std core: identifiers, PGNs, transport protocol, NAME, diagnostics
 sae-j1939-host = "0.3"    # std host layer: Ecu, Bus, SocketCAN transport
 ```
+
+Two optional features, both purely additive:
+
+- **`std`** — `std::error::Error` impls.
+- **`defmt`** — derives `defmt::Format` on the public types, so an MCU can log
+  them. `Frame` logs in `candump` form, so a frame captured from a
+  microcontroller replays with `cansend` exactly like one from a host.
 
 The core is `no_std` by default; enable `std` for `std::error::Error` impls
 (`sae-j1939-rs = { version = "0.3", features = ["std"] }`). On a microcontroller,
@@ -392,6 +405,19 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
   a global request makes both announce themselves, an unsupported request is
   NACKed, a three-fault DM1 crosses the bus over BAM, and a bandwidth-limited
   sender is never asked for more packets than it allowed.
+
+- **Replay a real capture, on any platform.** `candump -l can0` on the vehicle,
+  then analyse the file anywhere — no CAN interface and no Linux needed:
+
+  ```bash
+  cargo run -p sae-j1939-host --example replay -- candump-2026-08-02_120000.log
+  ```
+
+  Multi-packet transfers reassemble, engine parameters decode into units, and
+  trouble codes read out. The replay drives the protocol timers from the
+  *capture's own timestamps*, so a transfer that stalled on the real bus stalls
+  here at the same point — which is only possible because the state machines own
+  no clock.
 
 - **On-bus decode (Linux, no hardware).** Watch the stack reassemble real
   traffic over a virtual CAN interface:

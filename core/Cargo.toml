@@ -19,6 +19,7 @@ all-features = true
 
 [dependencies]
 embedded-can.workspace = true
+defmt = { workspace = true, optional = true }
 
 # Only the tests need bounded collections; the library itself is plain arrays.
 [dev-dependencies]
@@ -29,3 +30,6 @@ default = []
 # `std` enables host-side conveniences (e.g. `std::error::Error` impls).
 # It must never be required by the core protocol logic.
 std = []
+# `defmt` derives `defmt::Format` on the public types, for logging on a
+# microcontroller. Purely additive: it changes no behaviour.
+defmt = ["dep:defmt"]

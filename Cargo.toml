@@ -23,5 +23,9 @@ embedded-can = "0.4"
 # Bounded collections, used only by the core crate's tests.
 heapless = "0.8"
 
+# Logging on a microcontroller, where formatting a string costs more than the
+# work being logged. Optional; off by default.
+defmt = "1"
+
 # Linux SocketCAN transport (host only, Linux only).
 socketcan = "3.3"

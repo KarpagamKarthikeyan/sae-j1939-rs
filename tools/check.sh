@@ -29,6 +29,26 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 step "cargo test (workspace, all features) — unit, integration, and doctests"
 cargo test --workspace --all-features
 
+# `--all-features` turns everything on at once, so a feature that only breaks
+# *alone* slips through it. Check each combination that a user could actually
+# select.
+step "feature matrix"
+for features in "" "std" "defmt" "std,defmt"; do
+    if [[ -z "$features" ]]; then
+        echo "  -> default"
+        cargo build -p sae-j1939-rs --no-default-features
+    else
+        echo "  -> $features"
+        cargo build -p sae-j1939-rs --no-default-features --features "$features"
+    fi
+done
+# defmt exists for microcontrollers, so it has to work on one.
+if rustup target list --installed | grep -qx "$NO_STD_TARGET"; then
+    echo "  -> defmt on $NO_STD_TARGET"
+    cargo build -p sae-j1939-rs --no-default-features --features defmt \
+        --target "$NO_STD_TARGET"
+fi
+
 step "cargo doc (warnings denied)"
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 

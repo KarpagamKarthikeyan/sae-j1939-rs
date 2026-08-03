@@ -77,6 +77,7 @@ pub const fn bit_position(byte: u16, bit: u16) -> u16 {
 ///
 /// The variants that are not [`SpnValue::Valid`] are J1939's in-band status
 /// codes, which occupy the top of every parameter's range.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SpnValue {
     /// A real measurement, scaled into the parameter's unit.
@@ -105,6 +106,7 @@ impl SpnValue {
 }
 
 /// The raw field, before scaling, classified against J1939's reserved ranges.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawValue {
     /// A usable raw field.
@@ -121,6 +123,7 @@ pub enum RawValue {
 ///
 /// Build one with [`Spn::new`], or take a ready-made definition from
 /// [`catalogue`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spn {
     /// The SPN number assigned by SAE.

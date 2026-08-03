@@ -66,6 +66,19 @@ impl core::fmt::Display for Name {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for Name {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(
+            f,
+            "NAME mfr={=u16} id={=u32} fn={=u8:#04x}",
+            self.manufacturer_code(),
+            self.identity_number(),
+            self.function()
+        )
+    }
+}
+
 /// Every field, because the packed `u64` is unreadable and the fields are
 /// exactly what you need when arbitration does something surprising.
 impl core::fmt::Debug for Name {

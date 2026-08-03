@@ -60,6 +60,26 @@ impl core::fmt::Display for Id {
     }
 }
 
+/// The same decode the `Debug` impl gives, since a log line is where you most
+/// need to see what an identifier meant.
+#[cfg(feature = "defmt")]
+impl defmt::Format for Id {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(
+            f,
+            "{=u32:08X} prio={=u8} pgn={=u32:#08x} sa={}",
+            self.raw,
+            self.priority().as_u8(),
+            self.pgn().as_u32(),
+            self.source_address()
+        );
+        match self.destination_address() {
+            Some(destination) => defmt::write!(f, " da={}", destination),
+            None => defmt::write!(f, " broadcast"),
+        }
+    }
+}
+
 /// Prints the identifier and what it decodes to, because a bare number is not
 /// something anyone can check at a glance.
 impl core::fmt::Debug for Id {

@@ -50,6 +50,7 @@ pub const MAX_POINTER: u32 = 0x00FF_FFFF;
 pub const MAX_EDC_PARAMETER: u32 = 0x00FF_FFFF;
 
 /// What a [`Dm14`] asks the ECU to do.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryCommand {
     /// Erase the addressed region.
@@ -102,6 +103,7 @@ impl MemoryCommand {
 }
 
 /// How the pointer and pointer extension of a [`Dm14`] combine.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PointerType {
     /// The extension is the high-order part of the address: a 32-bit pointer
@@ -156,6 +158,7 @@ pub mod key {
 /// byte 5    pointer extension
 /// bytes 6-7 key, little-endian
 /// ```
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dm14 {
     /// How many bytes are being requested (11 bits).
@@ -252,6 +255,7 @@ impl Dm14 {
 }
 
 /// The status an ECU reports in a [`Dm15`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryStatus {
     /// Go ahead with the requested operation.
@@ -305,6 +309,7 @@ pub mod seed {
 /// The byte layout mirrors DM14: an 11-bit count split across bytes 0 and 1,
 /// the 3-bit status where DM14 has its command, a 24-bit parameter, an
 /// extension byte, and a 16-bit seed where DM14 has its key.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dm15 {
     /// How many bytes the ECU will allow (11 bits).
@@ -384,6 +389,7 @@ const fn unpack_count(low: u8, packed: u8) -> u16 {
 /// byte 0    number of data bytes that follow
 /// byte 1+   the data
 /// ```
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dm16<'a> {
     data: &'a [u8],

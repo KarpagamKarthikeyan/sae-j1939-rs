@@ -51,6 +51,7 @@ const FILL: u8 = 0xFF;
 /// byte 0    number of working set members, including the master
 /// bytes 1-7 reserved
 /// ```
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkingSetMaster {
     /// How many ECUs are in the set, the master included.

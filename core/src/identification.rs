@@ -44,6 +44,7 @@ pub const DELIMITER: u8 = b'*';
 /// A field is the run of bytes before each `*`. Trailing bytes with no
 /// terminating delimiter — which some devices emit on the last field — are
 /// yielded as a final field rather than discarded.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone)]
 pub struct Fields<'a> {
     rest: &'a [u8],
@@ -130,6 +131,7 @@ macro_rules! identification {
         }
     ) => {
         $(#[$meta])*
+        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct $name<'a> {
             data: &'a [u8],
@@ -214,6 +216,7 @@ identification! {
 /// assert_eq!(software.field_str(1), Some("APP-2.4.1"));
 /// assert!(software.count_is_consistent());
 /// ```
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SoftwareIdentification<'a> {
     declared: u8,

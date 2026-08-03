@@ -50,6 +50,7 @@ use crate::types::{Address, Priority, Result};
 pub const ADDRESS_CLAIM_WINDOW_MS: u16 = 250;
 
 /// What a [`Node`] wants after handling a frame.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event<'a> {
     /// Nothing to do.
@@ -71,6 +72,7 @@ pub enum Event<'a> {
 }
 
 /// What an [`Outgoing`] message wants next.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Progress {
     /// Nothing to do — wait for the peer, or for the pacing interval.
@@ -123,6 +125,7 @@ pub enum Progress {
 /// assert!(!tx.needs_pacing(), "RTS/CTS is flow-controlled, not timed");
 /// # let _ = (rts, Progress::Idle);
 /// ```
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 pub struct Outgoing<'a> {
     pgn: Pgn,
@@ -132,6 +135,7 @@ pub struct Outgoing<'a> {
     state: OutgoingState<'a>,
 }
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 enum OutgoingState<'a> {
     /// A message that fits one frame. The payload is kept rather than a built
@@ -291,6 +295,7 @@ fn tp_id(group: Pgn, destination: Address, source: Address) -> Option<Id> {
 ///
 /// `BUF` is the largest message this node will accept, and `SESSIONS` how many
 /// peers may be mid-transfer at once (see [`Reassembler`]).
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 pub struct Node<const BUF: usize, const SESSIONS: usize = 1> {
     claimer: AddressClaimer,

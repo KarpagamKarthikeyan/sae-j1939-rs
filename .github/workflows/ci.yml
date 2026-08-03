@@ -37,6 +37,25 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  features:
+    name: feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      # `--all-features` enables everything at once, so a feature that breaks
+      # only in isolation slips past it.
+      - run: cargo build -p sae-j1939-rs --no-default-features
+      - run: cargo build -p sae-j1939-rs --no-default-features --features std
+      - run: cargo build -p sae-j1939-rs --no-default-features --features defmt
+      - run: cargo build -p sae-j1939-rs --no-default-features --features std,defmt
+      # defmt is for microcontrollers, so it must build for one.
+      - run: cargo build -p sae-j1939-rs --no-default-features --features defmt --target thumbv7em-none-eabihf
+      - run: cargo clippy -p sae-j1939-rs --features defmt --all-targets -- -D warnings
+
   no_std:
     name: no_std build (thumbv7em)
     runs-on: ubuntu-latest

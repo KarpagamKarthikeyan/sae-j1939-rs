@@ -125,6 +125,7 @@ const FILL: u8 = 0xFF;
 
 /// Why a transport-protocol session was aborted (J1939-21 connection abort
 /// reasons).
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbortReason {
     /// Already in one or more connection-managed sessions and cannot support
@@ -185,6 +186,7 @@ impl AbortReason {
 ///
 /// Every variant is eight bytes on the wire, discriminated by the control byte
 /// and carrying the PGN of the message being transported in bytes 5..8.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TpCm {
     /// Request To Send: the sender offers a destination-specific transfer.
@@ -371,6 +373,7 @@ impl TpCm {
 
 /// A Transport Protocol Data Transfer packet (PGN `0x00EB00`): a 1-based
 /// sequence number followed by seven payload bytes.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TpDt {
     /// The 1-based packet sequence number.
@@ -418,6 +421,7 @@ impl TpDt {
 }
 
 /// What a [`Reassembler`] wants the caller to do after a message.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq)]
 pub enum Rx<'a> {
     /// Nothing to do.
@@ -460,12 +464,14 @@ pub enum Rx<'a> {
 /// at a time, which is what J1939-21 requires; a second concurrent request from
 /// the same peer is aborted, and a request from a new peer when every slot is
 /// full is refused for lack of resources.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 pub struct Reassembler<const N: usize, const SESSIONS: usize = 1> {
     slots: [Slot<N>; SESSIONS],
 }
 
 /// One in-flight transfer and the buffer it is filling.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
 struct Slot<const N: usize> {
     buffer: [u8; N],
@@ -479,6 +485,7 @@ impl<const N: usize> Slot<N> {
     };
 }
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
 struct Session {
     source: Address,
@@ -839,6 +846,7 @@ const fn grant_window(packets: u8, max_packets_per_cts: u8) -> u8 {
 }
 
 /// What a [`Transmitter`] wants the caller to do next.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tx {
     /// Nothing to do; wait for the peer.
@@ -873,6 +881,7 @@ pub enum Tx {
 /// assert!(tx.next_packet().is_none());
 /// assert!(tx.is_complete());
 /// ```
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 pub struct Transmitter<'a> {
     pgn: Pgn,

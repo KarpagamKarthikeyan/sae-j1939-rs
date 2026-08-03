@@ -36,6 +36,7 @@ pub const REQUEST_LEN: usize = 3;
 const FILL: u8 = 0xFF;
 
 /// A request for another ECU to transmit a parameter group.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Request {
     /// The parameter group being asked for.
@@ -79,6 +80,7 @@ impl Request {
 }
 
 /// The control byte of an [`Acknowledgement`]: how the request was received.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckControl {
     /// Positive acknowledgement — the parameter group is supported and the
@@ -133,6 +135,7 @@ impl AckControl {
 /// byte 4    address of the ECU that is acknowledging
 /// bytes 5-7 the PGN being acknowledged, little-endian
 /// ```
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Acknowledgement {
     /// How the request was received.

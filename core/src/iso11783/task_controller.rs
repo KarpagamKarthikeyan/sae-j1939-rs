@@ -66,6 +66,7 @@ pub const DEVICE_ELEMENT: u16 = 0;
 /// What a [`ProcessData`] message is asking for or reporting.
 ///
 /// The low nibble of byte 0.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     /// Technical capabilities: version and supported options.
@@ -153,6 +154,7 @@ impl Command {
 /// ISO 11783-11 assigns these. The [`ddi`] module names a few common ones; the
 /// full dictionary runs to hundreds, so treat these as a starting point and use
 /// [`Ddi::new`] for anything else.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Ddi(u16);
 
@@ -218,6 +220,7 @@ pub mod ddi {
 }
 
 /// One Process Data message.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessData {
     /// What to do about the value.
@@ -326,6 +329,7 @@ impl ProcessData {
 /// assert!(DeviceDescriptor::needs_extended_transport(40_000));
 /// assert!(!DeviceDescriptor::needs_extended_transport(500));
 /// ```
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceDescriptor;
 

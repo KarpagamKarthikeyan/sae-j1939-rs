@@ -93,6 +93,7 @@ pub const fn packet_count(size: u32) -> u32 {
 
 /// An Extended Transport Protocol connection-management message (PGN
 /// `0x00C800`).
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EtpCm {
     /// Request To Send: the sender offers a transfer of `size` bytes.
@@ -263,6 +264,7 @@ impl EtpCm {
 /// An Extended Transport Protocol data packet (PGN `0x00C700`).
 ///
 /// The sequence number is relative to the last [`EtpCm::Dpo`], not absolute.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EtpDt {
     /// The 1-based sequence number *within the current block*.
@@ -309,6 +311,7 @@ impl EtpDt {
 }
 
 /// What a [`Reassembler`] wants the caller to do next.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq)]
 pub enum Rx<'a> {
     /// Nothing to do.
@@ -334,11 +337,13 @@ pub enum Rx<'a> {
 /// the protocol ceiling of 1785 bytes is a plausible buffer, an ETP buffer is a
 /// real memory decision: a transfer may be 117 MB, and refusing early is the
 /// point of the parameter.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 pub struct Reassembler<const N: usize, const SESSIONS: usize = 1> {
     slots: [Slot<N>; SESSIONS],
 }
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
 struct Slot<const N: usize> {
     buffer: [u8; N],
@@ -352,6 +357,7 @@ impl<const N: usize> Slot<N> {
     };
 }
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
 struct Session {
     source: Address,
@@ -646,6 +652,7 @@ const fn block_size(remaining: u32, _from: u32) -> u8 {
 }
 
 /// What a [`Transmitter`] wants the caller to do next.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tx {
     /// Nothing to do; wait for the peer.
@@ -663,6 +670,7 @@ pub enum Tx {
 ///
 /// Borrows the payload, which for ETP is the difference between sending a
 /// 100 KiB object pool and having nowhere to put a copy of it.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 pub struct Transmitter<'a> {
     pgn: Pgn,
