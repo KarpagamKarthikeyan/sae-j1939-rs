@@ -21,10 +21,11 @@ does not own, and where the boundaries fall.
 6. [Transport protocol sequences](#6-transport-protocol-sequences)
 7. [Address claiming state machine](#7-address-claiming-state-machine)
 8. [Reassembler session model](#8-reassembler-session-model)
-9. [Memory model](#9-memory-model)
-10. [Sans-I/O design rationale](#10-sans-io-design-rationale)
-11. [Error handling](#11-error-handling)
-12. [Testing strategy](#12-testing-strategy)
+9. [Diagnostic fault lifecycle](#9-diagnostic-fault-lifecycle)
+10. [Memory model](#10-memory-model)
+11. [Sans-I/O design rationale](#11-sans-io-design-rationale)
+12. [Error handling](#12-error-handling)
+13. [Testing strategy](#13-testing-strategy)
 
 ---
 
@@ -59,7 +60,7 @@ flowchart TB
 
     subgraph core["core: sae-j1939-rs (no_std)"]
         node["node::Node / node::Outgoing"]
-        proto["address_claim, tp, request, diagnostics,<br/>memory_access, identification, iso11783,<br/>proprietary, spn"]
+        proto["address_claim, tp, request, diagnostics,<br/>fault_log, memory_access, identification,<br/>iso11783, proprietary, spn"]
         wire["id, pgn, frame, name, types"]
         canbridge["can<br/>embedded-can bridge"]
     end
@@ -123,6 +124,7 @@ follows it directly, so a module maps to a part you can look up.
 | `name` | -81 | The 64-bit ECU NAME | `Name` |
 | `address_claim` | -81 | Claiming, defending, relocating, commanded address | `AddressClaimer`, `ClaimState`, `Claim`, `ClaimAction` |
 | `diagnostics` | -73 | DM1/DM2 trouble codes and lamp status, DM3 clear | `Lamps`, `Dtc`, `Message`, `dm3` |
+| `fault_log` | -73 | The fault state an ECU reports about *itself* | `FaultLog` |
 | `memory_access` | -73 | DM14/DM15/DM16 memory read, write, data transfer | `Dm14`, `Dm15`, `Dm16` |
 | `identification` | -71 | Software / ECU / component identification | `SoftwareIdentification`, `EcuIdentification`, `ComponentIdentification` |
 | `spn` | -71 | Bit extraction, scaling, and the status ranges | `Spn`, `SpnValue`, `RawValue`, `catalogue` |
@@ -823,7 +825,119 @@ expires. The outcome is correct; it just takes 750 ms to get there.
 
 ---
 
-## 9. Memory model
+## 9. Diagnostic fault lifecycle
+
+Diagnostics has two sides, and they need different things from the crate.
+
+A **tool** reading someone else's faults needs only a codec: bytes in, trouble
+codes out. That is `diagnostics::Message`, and it is stateless.
+
+An **ECU** reporting its own needs memory. Which faults are active, which have
+been active, how many times each has occurred, which lamps they light, and when
+the next DM1 is due — none of that is derivable from a single message. That is
+`fault_log::FaultLog<N>`, and it is the only stateful piece in the diagnostic
+layer.
+
+### The state a fault moves through
+
+```mermaid
+stateDiagram-v2
+    [*] --> Absent
+    Absent --> Active: set(spn, fmi, lamp)\ncount = 1
+    Active --> Active: set(..) again\nsame occurrence, count unchanged
+    Active --> PreviouslyActive: clear(spn, fmi)\ncondition stopped
+    PreviouslyActive --> Active: set(..)\ncount + 1
+    Active --> Absent: clear_active() [DM11]\nno history recorded
+    PreviouslyActive --> Absent: clear_previously_active() [DM3]
+
+    note right of Active
+        Reported in DM1.
+        Lights its lamp.
+    end note
+    note right of PreviouslyActive
+        Reported in DM2.
+        Lights nothing.
+    end note
+```
+
+Three transitions carry a decision worth stating:
+
+- **`Active --> Active` does not touch the occurrence count.** J1939-73 counts
+  inactive-to-active transitions, not assertions. Firmware that re-checks a
+  condition every control cycle would otherwise report a count of several
+  thousand within a minute.
+- **`Active --> Absent` on DM11 records no history.** A reset command is not
+  evidence that the condition stopped. If it persists, the ECU raises the fault
+  again from a fresh count; writing it into the previously-active list would
+  claim something happened that did not.
+- **`PreviouslyActive --> Active` resumes the count.** A fault that comes back is
+  the same fault, and the count is why anyone cares.
+
+### Capacity, and which end to lose from
+
+Both lists are bounded by `N`, and they overflow in opposite directions on
+purpose:
+
+| List | When full | Why |
+|------|-----------|-----|
+| Active | Refuse the newest | In a cascade the first fault is usually the cause and the rest are consequences |
+| Previously active | Drop the oldest | It is a history, and a technician is diagnosing the recent past |
+
+### Who transmits
+
+`FaultLog` owns no bus and no clock, so it cannot transmit — it only says *when*
+a DM1 is due. J1939-73 asks for one per second while any fault is active, one
+more when the last clears, then silence; both rules collapse into a single timer
+because the standard's "report on change" is capped at once per second anyway.
+
+That final all-clear is not decoration. The periodic DM1 stops when the fault
+list empties, so without an explicit "nothing is wrong any more" a tool cannot
+tell a repaired ECU from one that fell off the bus.
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant Log as FaultLog
+    participant Ecu as Ecu / Outgoing
+    participant Tool as Service tool
+
+    App->>Log: set(100, 1, RedStop)
+    loop every poll
+        Ecu->>Log: tick(elapsed_ms)
+    end
+    Log-->>Ecu: due
+    Ecu->>Tool: DM1 (lamps + 1 code)
+    Note over Ecu,Tool: two or more codes exceed<br/>a frame → BAM, paced
+
+    Tool->>Ecu: Request DM1
+    Ecu->>Tool: DM1 (answered inside poll)
+
+    App->>Log: clear(100, 1)
+    Ecu->>Log: tick(elapsed_ms)
+    Log-->>Ecu: due (all-clear owed)
+    Ecu->>Tool: DM1 (lamps off, no codes)
+    Note over Ecu,Tool: then silence, which now means<br/>"healthy" rather than "gone"
+```
+
+On a host, `Ecu` closes this loop: it owns a `FaultLog`, ticks it from `poll`,
+and answers requests for DM1, DM2 and DM5 plus DM3 and DM11 clears. On a
+microcontroller the application does the same three lines itself — see
+`core/examples/mcu_node.rs` — because putting a transmit path inside `Node`
+would give it a clock, which is the one thing the sans-I/O design is protecting.
+
+### Where the tool side lives
+
+Symmetrically, `Ecu` is also the tool: `request_wait` sends a request and blocks
+for the answer, and `read_active_faults`, `read_readiness` and the rest are thin
+layers over it. The distinction the API preserves is between **no answer** and
+**refused** — J1939 has no obligatory "unsupported" reply, so silence is the
+normal way of declining, while an explicit negative acknowledgement means the
+ECU heard and said no. Collapsing those two into one result would lose the only
+signal that tells you whether the ECU is even there.
+
+---
+
+## 10. Memory model
 
 Nothing in the core allocates. Every encoder writes into a fixed array
 (`[u8; 3]`, `[u8; 8]`) or a caller-supplied `&mut [u8]`; every parser borrows
@@ -889,7 +1003,7 @@ comment states it must never be required by the core protocol logic.
 
 ---
 
-## 10. Sans-I/O design rationale
+## 11. Sans-I/O design rationale
 
 Every state machine in the core consumes and produces values. None of them owns
 a socket, and none of them reads a clock.
@@ -945,7 +1059,7 @@ fire. That was a real bug, and there is a regression test named for it.
 
 ---
 
-## 11. Error handling
+## 12. Error handling
 
 One error type, `types::Error`, `#[non_exhaustive]`, `Copy`, with a `Display`
 that says what actually went wrong. `std::error::Error` is implemented behind
@@ -1003,7 +1117,7 @@ regression test named for that mistake.
 
 ---
 
-## 12. Testing strategy
+## 13. Testing strategy
 
 Five layers, each aimed at a different class of bug.
 

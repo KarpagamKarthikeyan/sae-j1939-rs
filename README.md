@@ -11,10 +11,11 @@ on a bare-metal ECU *and* on a host (Linux/SocketCAN).
 J1939 is the CAN-based protocol behind heavy vehicles: trucks, agricultural and
 construction equipment, and marine engines.
 
-> **Status: early development (0.3).** The API will change. The J1939-21 data
-> link and transport layers, J1939-81 network management, J1939-73 diagnostics,
-> the J1939-71 identification groups, and the ISO 11783 valve groups are
-> implemented and tested — see below.
+> **Status: early development (0.4).** The API will change. The J1939-21 data
+> link and transport layers, J1939-81 network management, J1939-73 diagnostics
+> — from both sides: an ECU that reports its own faults and a tool that reads
+> another's — the J1939-71 identification groups, and the ISO 11783 valve
+> groups are implemented and tested. See below.
 
 ## Why
 
@@ -26,7 +27,7 @@ on a microcontroller with no allocator, as well as on a laptop.
 `sae-j1939-rs` is built for both from the same source:
 
 - **The whole protocol, not just the identifier.** The transport protocol in both
-  directions, address claiming, diagnostics, and identification.
+  directions, address claiming, diagnostics from both sides, and identification.
 - **`no_std` and allocation-free.** The core compiles for bare metal, holds no
   hidden buffers, and lets you set both the largest message an ECU will accept
   and how many peers may be mid-transfer at once — so its memory use is a
@@ -55,6 +56,10 @@ on a microcontroller with no allocator, as well as on a laptop.
 | **DM5**: readiness — fault counts and compliance level | -73 | ✅ |
 | **DM3 / DM11**: clear previously active and active trouble codes | -73 | ✅ |
 | **DM13**: stop/start broadcast, to quieten a bus for a tool | -73 | ✅ |
+| **`FaultLog`**: fault lifecycle — occurrence counts, lamps, 1 Hz DM1 timing | -73 | ✅ |
+| **An ECU that reports itself**: periodic DM1, and DM1/2/5/3/11 on request | -73 | ✅ |
+| **A tool that reads others**: faults, history, readiness, software version | -73 | ✅ |
+| **Bus inventory and scan**: who is out there, and what NAME they claimed | -81 | ✅ |
 | **`Node`**: one type doing claiming, filtering, reassembly, and dispatch | — | ✅ |
 | **`Outgoing`**: one type choosing single-frame vs BAM vs RTS/CTS on the way out | — | ✅ |
 | **`Ecu`**: `Node` on any `Bus` — clock, BAM pacing, RTS/CTS handshake | — | ✅ |
@@ -86,8 +91,8 @@ known-good byte sequences — see [Testing & validation](#testing--validation).
 
 ```toml
 [dependencies]
-sae-j1939-rs = "0.3"      # no_std core: identifiers, PGNs, transport protocol, NAME, diagnostics
-sae-j1939-host = "0.3"    # std host layer: Ecu, Bus, SocketCAN transport
+sae-j1939-rs = "0.4"      # no_std core: identifiers, PGNs, transport protocol, NAME, diagnostics
+sae-j1939-host = "0.4"    # std host layer: Ecu, Bus, SocketCAN transport
 ```
 
 Two optional features, both purely additive:
@@ -98,7 +103,7 @@ Two optional features, both purely additive:
   microcontroller replays with `cansend` exactly like one from a host.
 
 The core is `no_std` by default; enable `std` for `std::error::Error` impls
-(`sae-j1939-rs = { version = "0.3", features = ["std"] }`). On a microcontroller,
+(`sae-j1939-rs = { version = "0.4", features = ["std"] }`). On a microcontroller,
 depend only on `sae-j1939-rs` and drive it with your HAL's [`embedded-can`]
 implementation — no host crate needed. In `sae-j1939-host`, the SocketCAN
 transport is compiled only on Linux. **MSRV: Rust 1.75.**
@@ -121,6 +126,11 @@ let mut ecu = SocketCanEcu::open("can0", name, Address::new(0x80))?;
 ecu.claim_address()?;                                  // blocks 250 ms, handles contention
 ecu.request(Address::GLOBAL, pgn::ADDRESS_CLAIMED)?;   // who else is here?
 
+// Something went wrong. From here on this ECU broadcasts a DM1 naming it once
+// a second, answers a request for DM1/DM2/DM5, and honours a DM11 clear —
+// including splitting a long fault list across the transport protocol.
+ecu.set_fault(100, 1, Lamp::RedStop)?;      // oil pressure low
+
 loop {
     // `poll` returns None whenever the bus is quiet — drive it in a loop, not
     // `while let Some(..)`, which would stop at the first gap in traffic.
@@ -128,11 +138,6 @@ loop {
         println!("{:#08x} from {:#04x}", message.pgn.as_u32(), message.source.as_u8());
     }
 }
-
-// Longer than eight bytes? It goes out over the transport protocol, paced.
-let mut dm1 = [0u8; 64];
-let len = diagnostics::encode(lamps, &three_faults, &mut dm1)?;   // 14 bytes
-ecu.broadcast(pgn::DM1, &dm1[..len])?;
 ```
 
 ### ...or drive the protocol yourself
@@ -333,6 +338,70 @@ for dtc in dm.dtcs() {
 Two or more trouble codes overflow a CAN frame, which is exactly why DM1 needs
 the transport protocol — `encode` produces the payload and `Transmitter` ships it.
 
+### ...or read them off a real ECU
+
+That is the codec. On the host, `Ecu` does the whole exchange — request,
+timeout, multi-packet reassembly, decode:
+
+```rust
+use sae_j1939_host::ecu::{SocketCanEcu, DIAGNOSTIC_TIMEOUT};
+
+let mut tool = SocketCanEcu::open("can0", name, Address::new(0xF9))?;
+tool.claim_address()?;
+
+// Who is on this bus?
+for (address, name) in tool.scan(Duration::from_secs(1))? {
+    println!("{address}  {name}");
+}
+
+let engine = Address::new(0x00);
+if let Some(report) = tool.read_active_faults(engine, DIAGNOSTIC_TIMEOUT)? {
+    for dtc in &report.dtcs {
+        println!("{dtc}");        // SPN 100 FMI 1 (x2)
+    }
+}
+```
+
+`Ok(None)` means the ECU did not answer, which on J1939 is the usual way of
+saying it does not support the request; a refusal comes back as an error
+carrying its reason, so silence and "no" stay distinguishable. There is also
+`read_previously_active_faults`, `read_readiness`,
+`read_software_identification`, and — deliberately separate, because clearing an
+*active* code destroys evidence without fixing anything — `clear_active_faults`
+and `clear_previously_active_faults`.
+
+`cargo run -p sae-j1939-host --example service_tool -- --target 0x80` is this as
+a working tool.
+
+### Report your own faults
+
+The mirror image, and the part a codec alone cannot do: an ECU has to remember
+which faults are active, how many times each has occurred, which lamps they
+light, and when the next DM1 is due. `FaultLog` is that memory — `no_std`,
+allocation-free, and owning neither a bus nor a clock:
+
+```rust
+use sae_j1939_rs::diagnostics::Lamp;
+use sae_j1939_rs::fault_log::FaultLog;
+
+let mut faults = FaultLog::<8>::new();       // at most 8 active, 8 historic
+faults.set(100, 1, Lamp::RedStop)?;          // oil pressure low
+
+// Once a second while anything is active — and once more when the last fault
+// clears, so a tool sees the lamps go out rather than just losing the signal.
+if faults.tick(elapsed_ms) {
+    let mut payload = [0u8; 34];
+    let len = faults.dm1(&mut payload)?;
+    bus.send_all(Outgoing::new(pgn::DM1, address, Address::GLOBAL, &payload[..len])?);
+}
+
+faults.clear(100, 1);                        // pressure recovered → now DM2 history
+```
+
+Re-asserting a live fault is not a new occurrence; a fault that clears and
+returns resumes its count. On the host, `Ecu` owns one of these and drives it
+for you — `set_fault` is all the above.
+
 ### Bring your own transport
 
 `Ecu` is generic over a two-method `Bus` trait, so it is not tied to SocketCAN or
@@ -385,7 +454,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 - **Nothing on the bus can panic the stack.** `core/tests/robustness.rs` feeds
   arbitrary bytes to every public decoder and to the top-level `Node::on_frame`
-  dispatch — 160,000 rounds from a deterministic generator, so any failure
+  dispatch — 200,000 rounds from a deterministic generator, so any failure
   reproduces from its seed. A panic in a decoder is not a bug report; on an MCU
   it is an ECU that stops controlling something.
 
@@ -405,6 +474,26 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
   a global request makes both announce themselves, an unsupported request is
   NACKed, a three-fault DM1 crosses the bus over BAM, and a bandwidth-limited
   sender is never asked for more packets than it allowed.
+
+- **Two real ECUs, on two threads, over one wire.** A tool and a faulted engine
+  controller are both full `Ecu`s on opposite ends of a shared link, each
+  genuinely blocking on the other: they claim addresses, the tool scans the bus
+  and reads back the NAME, then reads readiness, pulls a two-fault DM1 across
+  the transport protocol, and clears the codes — with the engine confirming it
+  really did. Nothing is stubbed, so this covers the parts scripted tests
+  cannot: two claims racing, and a handshake with a live counterparty.
+
+- **The fault log is fuzzed as a state machine, not a decoder.** A decoder can
+  be checked one input at a time; a state machine cannot. `robustness.rs` drives
+  an arbitrary sequence of raise/clear/tick/reset operations and asserts the
+  invariants a wrong sequence would break silently — a list past its capacity,
+  the same fault recorded twice (which a tool reads as two faults), or a code
+  that no longer fits the four bytes it will be encoded into.
+
+- **The bare-metal reporting path has its own test.** `core/tests/fault_reporting.rs`
+  runs `FaultLog` → `Outgoing` → a peer's `Reassembler` with no host crate
+  involved, at every fault count from one to a full log, so the boundary where a
+  DM1 stops fitting one frame is crossed rather than assumed.
 
 - **Replay a real capture, on any platform.** `candump -l can0` on the vehicle,
   then analyse the file anywhere — no CAN interface and no Linux needed:
@@ -438,11 +527,21 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
   # ...an engine controller frame, decoded into rpm and percent:
   cansend vcan0 0CF00400#FF8796E02EFFFFFF
 
-  # ...or a complete virtual ECU that claims an address and answers requests:
+  # ...or a complete virtual ECU that claims an address, reports its faults
+  # once a second, and answers requests:
   cargo run -p sae-j1939-host --example vcan_ecu
   cansend vcan0 18EAFFF9#00EE00        # who is on the bus?
   cansend vcan0 18EA80F9#CAFE00        # what faults do you have?
+
+  # ...and the tool that reads it properly — scan, readiness, faults, history:
+  cargo run -p sae-j1939-host --example service_tool -- --target 0x80
+  cargo run -p sae-j1939-host --example service_tool -- --target 0x80 --clear
   ```
+
+  The last pair is the whole diagnostic exchange as two processes on one bus,
+  and CI runs it: the tool must read the ECU's NAME, both its faults, and get an
+  acknowledgement back for the clear — with the ECU's own log confirming the
+  codes actually went.
 
 ## Design
 

@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "sae-j1939-host"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "sae-j1939-rs",
  "socketcan",
@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "sae-j1939-rs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "defmt",
  "embedded-can",

@@ -84,6 +84,7 @@
 //! | [`name`] | J1939-81 | The 64-bit ECU NAME |
 //! | [`address_claim`] | J1939-81 | Claiming, defending, and relocating an address |
 //! | [`diagnostics`] | J1939-73 | DM1/DM2 trouble codes and lamp status |
+//! | [`fault_log`] | J1939-73 | The fault state an ECU reports about itself |
 //! | [`memory_access`] | J1939-73 | DM14/DM15/DM16 memory read, write, and data transfer |
 //! | [`identification`] | J1939-71 | Software, ECU, and component identification |
 //! | [`spn`] | J1939-71 | Suspect Parameter Numbers: payload bytes to engineering units |
@@ -119,6 +120,7 @@ pub mod address_claim;
 pub mod can;
 pub mod diagnostics;
 pub mod etp;
+pub mod fault_log;
 pub mod frame;
 pub mod id;
 pub mod identification;

@@ -56,15 +56,18 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::time::{Duration, Instant};
 
 use sae_j1939_rs::address_claim::ClaimState;
+use sae_j1939_rs::diagnostics::{self, Dm5, Dtc, Lamp, Lamps, ObdCompliance};
 use sae_j1939_rs::etp::{self, EtpCm, EtpDt};
+use sae_j1939_rs::fault_log::FaultLog;
 use sae_j1939_rs::frame::Frame;
+use sae_j1939_rs::identification::SoftwareIdentification;
 use sae_j1939_rs::node::{Event, Node, Outgoing, Progress};
-use sae_j1939_rs::request::Request;
+use sae_j1939_rs::request::{Acknowledgement, Request};
 use sae_j1939_rs::tp::T3_TIMEOUT_MS;
 use sae_j1939_rs::{pgn, Address, Id, Name, Pgn, Priority};
 
@@ -87,6 +90,22 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1250);
 /// a busy bus.
 pub const CLAIM_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long the diagnostic readers wait for an ECU to answer.
+///
+/// Generous: a DM1 listing many faults arrives over the transport protocol,
+/// whose data packets are paced 50 ms apart, so a long fault list legitimately
+/// takes a while.
+pub const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How many active — and separately, how many previously active — trouble codes
+/// an [`Ecu`] remembers about itself.
+///
+/// Fixed rather than a generic parameter, because on a host there is no memory
+/// pressure that would justify tuning it and every extra const parameter is one
+/// more thing callers have to spell out. An ECU that needs a different bound can
+/// drive [`FaultLog`] itself and transmit with [`Ecu::broadcast`].
+pub const FAULT_CAPACITY: usize = 32;
+
 /// A J1939 ECU bound to a bus.
 ///
 /// `BUF` is the largest message it will accept and `SESSIONS` how many peers
@@ -103,6 +122,15 @@ pub struct Ecu<B: Bus, const BUF: usize = 1785, const SESSIONS: usize = 8> {
     /// Messages that arrived while we were busy doing something else, so that
     /// nothing is lost during a blocking handshake.
     pending: VecDeque<Message>,
+    /// What is wrong with *this* ECU, broadcast as DM1 and answered on request.
+    faults: FaultLog<FAULT_CAPACITY>,
+    /// Who else is on the bus. `Node` treats address claims as network
+    /// management and never passes them up, so they are recorded on the way
+    /// past — otherwise a tool could not answer the first question anyone asks
+    /// of a bus, which is what is on it.
+    inventory: BTreeMap<u8, Name>,
+    /// What this ECU claims about emissions compliance in DM5.
+    obd_compliance: ObdCompliance,
     last_tick: Instant,
 }
 
@@ -165,6 +193,9 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
             node: Node::new(name, preferred),
             etp: etp::Reassembler::new(),
             pending: VecDeque::new(),
+            faults: FaultLog::new(),
+            inventory: BTreeMap::new(),
+            obd_compliance: ObdCompliance::NotIntended,
             last_tick: Instant::now(),
         }
     }
@@ -369,6 +400,383 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
         Ok(())
     }
 
+    // ---------------------------------------------------------------------
+    // Reporting this ECU's own faults (J1939-73).
+    // ---------------------------------------------------------------------
+
+    /// What is currently wrong with this ECU.
+    pub fn faults(&self) -> &FaultLog<FAULT_CAPACITY> {
+        &self.faults
+    }
+
+    /// The fault log, to raise and clear faults directly.
+    ///
+    /// [`Ecu::set_fault`] and [`Ecu::clear_fault`] cover the common cases;
+    /// reach for this to set flash status, or to clear the whole log.
+    pub fn faults_mut(&mut self) -> &mut FaultLog<FAULT_CAPACITY> {
+        &mut self.faults
+    }
+
+    /// Report a fault, lighting `lamp` until it is cleared.
+    ///
+    /// From here on [`Ecu::poll`] broadcasts a DM1 once a second naming this
+    /// code, and answers a request for DM1 with it — no further work needed.
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if the code does not fit the
+    /// wire format or the log is full; see
+    /// [`FaultLog::set`](sae_j1939_rs::fault_log::FaultLog::set).
+    ///
+    /// ```
+    /// # use std::cell::RefCell;
+    /// # use std::collections::VecDeque;
+    /// # use std::io;
+    /// # use sae_j1939_host::bus::Bus;
+    /// # use sae_j1939_host::ecu::Ecu;
+    /// # use sae_j1939_host::sae_j1939_rs::{Address, Frame, Name};
+    /// use sae_j1939_host::sae_j1939_rs::diagnostics::Lamp;
+    /// # #[derive(Default)]
+    /// # struct FakeBus { sent: RefCell<Vec<Frame>> }
+    /// # impl Bus for FakeBus {
+    /// #     fn send_frame(&self, f: &Frame) -> io::Result<()> { self.sent.borrow_mut().push(*f); Ok(()) }
+    /// #     fn recv_frame(&self) -> io::Result<Option<Frame>> { Ok(None) }
+    /// # }
+    /// # let name = Name::new().with_manufacturer_code(300).with_identity_number(1);
+    /// # let mut ecu = Ecu::<_, 1785, 4>::new(FakeBus::default(), name, Address::new(0x80));
+    /// # ecu.claim_address()?;
+    /// // Oil pressure is low (SPN 100, FMI 1). Stop the engine.
+    /// ecu.set_fault(100, 1, Lamp::RedStop)?;
+    /// assert!(!ecu.faults().is_healthy());
+    ///
+    /// // Later, the pressure recovers.
+    /// ecu.clear_fault(100, 1);
+    /// assert!(ecu.faults().is_healthy());
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn set_fault(&mut self, spn: u32, fmi: u8, lamp: Lamp) -> io::Result<()> {
+        self.faults.set(spn, fmi, lamp).map_err(invalid_input)
+    }
+
+    /// Retire a fault whose condition has gone away, returning whether it was
+    /// active. It moves to the previously active list, reported as DM2.
+    pub fn clear_fault(&mut self, spn: u32, fmi: u8) -> bool {
+        self.faults.clear(spn, fmi)
+    }
+
+    /// Broadcast the active fault list as DM1 now, rather than waiting for the
+    /// periodic one.
+    ///
+    /// Two or more active faults exceed a CAN frame, so the message goes out
+    /// over the transport protocol and this blocks for the BAM pacing.
+    pub fn send_dm1(&mut self) -> io::Result<()> {
+        let mut payload = vec![0u8; self.faults.dm1_len()];
+        let len = self.faults.dm1(&mut payload).map_err(invalid_input)?;
+        // DM1 is a PDU2 parameter group, so it is broadcast even when it is
+        // answering one tool's request — there is no destination field to put
+        // the requester in.
+        self.broadcast(pgn::DM1, &payload[..len])
+    }
+
+    /// What this ECU reports for its OBD compliance level in DM5.
+    ///
+    /// Defaults to [`ObdCompliance::NotIntended`], which is the truth for an
+    /// ECU that is not an emissions device. Set it if yours is one — the crate
+    /// cannot know, and guessing would put a compliance claim on the bus that
+    /// nobody stands behind.
+    pub fn set_obd_compliance(&mut self, level: ObdCompliance) {
+        self.obd_compliance = level;
+    }
+
+    /// Broadcast readiness and fault counts as DM5 now.
+    ///
+    /// The counts come from the fault log, so they cannot drift out of step
+    /// with the DM1 and DM2 this ECU reports. The five monitor bytes are sent
+    /// as "not available": what a monitor has completed is something only the
+    /// application knows.
+    pub fn send_dm5(&mut self) -> io::Result<()> {
+        let readiness = Dm5::new(
+            saturating_count(self.faults.active().len()),
+            saturating_count(self.faults.previously_active().len()),
+            self.obd_compliance,
+        );
+        self.broadcast(pgn::DM5, &readiness.encode())
+    }
+
+    /// Broadcast the fault history as DM2 now.
+    pub fn send_dm2(&mut self) -> io::Result<()> {
+        let mut payload = vec![0u8; self.faults.dm2_len()];
+        let len = self.faults.dm2(&mut payload).map_err(invalid_input)?;
+        self.broadcast(pgn::DM2, &payload[..len])
+    }
+
+    /// Answer a diagnostic request aimed at this ECU.
+    ///
+    /// Returns whether the request was one this handles, so an unhandled
+    /// parameter group can still reach the application.
+    fn answer_diagnostic_request(
+        &mut self,
+        requester: Address,
+        request: &Request,
+    ) -> io::Result<bool> {
+        match request.pgn {
+            pgn::DM1 => self.send_dm1()?,
+            pgn::DM2 => self.send_dm2()?,
+            pgn::DM5 => self.send_dm5()?,
+            pgn::DM3 => {
+                self.faults.clear_previously_active();
+                self.acknowledge(requester, diagnostics::dm3::acknowledge(self.address()))?;
+            }
+            pgn::DM11 => {
+                self.faults.clear_active();
+                self.acknowledge(requester, diagnostics::dm11::acknowledge(self.address()))?;
+                // Clearing the codes put the lamps out, which is worth saying
+                // rather than leaving a tool to infer it from silence.
+                self.send_dm1()?;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Send an acknowledgement to whoever asked.
+    ///
+    /// Destination-specific: the requester asked, so the requester is told.
+    fn acknowledge(&self, requester: Address, ack: Acknowledgement) -> io::Result<()> {
+        let id = Id::from_parts(
+            Priority::DEFAULT,
+            pgn::ACKNOWLEDGEMENT,
+            requester,
+            self.node.address(),
+        )
+        .map_err(invalid_input)?;
+        self.bus.send_frame(&Frame::from_payload(id, ack.encode()))
+    }
+
+    // ---------------------------------------------------------------------
+    // Reading another ECU's diagnostics: the service-tool side.
+    // ---------------------------------------------------------------------
+
+    /// Every ECU heard claiming an address, in address order, with the NAME it
+    /// claimed with.
+    ///
+    /// Built up from whatever has gone past — an ECU that has not spoken since
+    /// this one started listening will not be here. [`Ecu::scan`] asks.
+    pub fn inventory(&self) -> impl Iterator<Item = (Address, Name)> + '_ {
+        self.inventory
+            .iter()
+            .map(|(&address, &name)| (Address::new(address), name))
+    }
+
+    /// Ask every ECU on the bus to identify itself, and listen for `duration`.
+    ///
+    /// A global request for Address Claimed, which each ECU answers with its
+    /// NAME. Ordinary traffic arriving meanwhile is queued for [`Ecu::poll`]
+    /// rather than dropped.
+    ///
+    /// One second is usually plenty; a busy bus with many ECUs deserves more.
+    /// The result is the whole inventory, not just this scan's answers, so
+    /// repeated scans accumulate.
+    pub fn scan(&mut self, duration: Duration) -> io::Result<Vec<(Address, Name)>> {
+        self.request(Address::GLOBAL, pgn::ADDRESS_CLAIMED)?;
+        let deadline = Instant::now() + duration;
+        while Instant::now() < deadline {
+            if let Some(message) = self.pump()? {
+                self.pending.push_back(message);
+            }
+        }
+        Ok(self.inventory().collect())
+    }
+
+    /// Ask `destination` for `requested` and wait for the answer.
+    ///
+    /// The blocking counterpart to [`Ecu::request`], and the primitive the
+    /// diagnostic readers below are built from. Traffic that arrives meanwhile
+    /// is handled normally and queued for [`Ecu::poll`] rather than dropped, so
+    /// this can be used on a live bus without losing anything. Messages already
+    /// queued when this is called are left alone: something that arrived before
+    /// the request cannot be the answer to it.
+    ///
+    /// A request to [`Address::GLOBAL`] returns the first answer from anyone.
+    ///
+    /// Returns an error if this ECU has not claimed an address — see
+    /// [`Ecu::broadcast`].
+    pub fn request_wait(
+        &mut self,
+        destination: Address,
+        requested: Pgn,
+        timeout: Duration,
+    ) -> io::Result<Response> {
+        self.request(destination, requested)?;
+        let deadline = Instant::now() + timeout;
+
+        while Instant::now() < deadline {
+            let Some(message) = self.pump()? else {
+                continue;
+            };
+            // A request to one ECU is answered by that ECU; a global one by
+            // whoever gets there first.
+            let from_target = destination.is_broadcast() || message.source == destination;
+
+            if from_target && message.pgn == requested {
+                return Ok(Response::Message(message));
+            }
+            if from_target && message.pgn == pgn::ACKNOWLEDGEMENT && message.data.len() >= 8 {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&message.data[..8]);
+                let ack = Acknowledgement::decode(&bytes);
+                if ack.pgn == requested {
+                    return Ok(Response::Acknowledged(ack));
+                }
+            }
+            // Not what we asked for. Somebody else may still want it.
+            self.pending.push_back(message);
+        }
+        Ok(Response::TimedOut)
+    }
+
+    /// Read the active trouble codes from `target` — a DM1 request.
+    ///
+    /// `Ok(None)` means the ECU did not answer within `timeout`, which on
+    /// J1939 is the usual way of saying it does not support the request.
+    /// [`io::ErrorKind::Unsupported`] means it answered and declined.
+    ///
+    /// ```
+    /// # use std::cell::RefCell;
+    /// # use std::collections::VecDeque;
+    /// # use std::io;
+    /// # use sae_j1939_host::bus::Bus;
+    /// # use sae_j1939_host::ecu::Ecu;
+    /// # use sae_j1939_host::sae_j1939_rs::{pgn, Address, Frame, Id, Name, Priority};
+    /// use sae_j1939_host::ecu::DIAGNOSTIC_TIMEOUT;
+    /// # #[derive(Default)]
+    /// # struct FakeBus { incoming: RefCell<VecDeque<Frame>>, sent: RefCell<Vec<Frame>> }
+    /// # impl Bus for FakeBus {
+    /// #     fn send_frame(&self, f: &Frame) -> io::Result<()> { self.sent.borrow_mut().push(*f); Ok(()) }
+    /// #     fn recv_frame(&self) -> io::Result<Option<Frame>> { Ok(self.incoming.borrow_mut().pop_front()) }
+    /// # }
+    /// # let engine = Address::new(0x00);
+    /// # let name = Name::new().with_manufacturer_code(300).with_identity_number(1);
+    /// # let mut tool = Ecu::<_, 1785, 4>::new(FakeBus::default(), name, Address::new(0xF9));
+    /// # tool.claim_address()?;
+    /// # // The engine answers with one fault: SPN 100 FMI 1, red stop lamp on.
+    /// # tool.bus().incoming.borrow_mut().push_back(Frame::from_payload(
+    /// #     Id::broadcast(Priority::DEFAULT, pgn::DM1, engine),
+    /// #     [0x10, 0x00, 0x64, 0x00, 0x01, 0x81, 0xFF, 0xFF],
+    /// # ));
+    /// // `tool` is any Ecu — a SocketCAN one on Linux, a test double here.
+    /// let report = tool.read_active_faults(engine, DIAGNOSTIC_TIMEOUT)?.unwrap();
+    ///
+    /// assert_eq!(report.dtcs.len(), 1);
+    /// assert_eq!(report.dtcs[0].spn, 100);
+    /// assert_eq!(report.dtcs[0].fmi, 1);
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn read_active_faults(
+        &mut self,
+        target: Address,
+        timeout: Duration,
+    ) -> io::Result<Option<FaultReport>> {
+        match self.request_wait(target, pgn::DM1, timeout)? {
+            Response::Message(message) => Ok(Some(FaultReport::parse(&message.data)?)),
+            Response::Acknowledged(ack) => refused(ack, "DM1"),
+            Response::TimedOut => Ok(None),
+        }
+    }
+
+    /// Read the fault history from `target` — a DM2 request. See
+    /// [`Ecu::read_active_faults`].
+    pub fn read_previously_active_faults(
+        &mut self,
+        target: Address,
+        timeout: Duration,
+    ) -> io::Result<Option<FaultReport>> {
+        match self.request_wait(target, pgn::DM2, timeout)? {
+            Response::Message(message) => Ok(Some(FaultReport::parse(&message.data)?)),
+            Response::Acknowledged(ack) => refused(ack, "DM2"),
+            Response::TimedOut => Ok(None),
+        }
+    }
+
+    /// Read emissions readiness and fault counts from `target` — a DM5 request.
+    pub fn read_readiness(
+        &mut self,
+        target: Address,
+        timeout: Duration,
+    ) -> io::Result<Option<Dm5>> {
+        match self.request_wait(target, pgn::DM5, timeout)? {
+            Response::Message(message) if message.data.len() >= 8 => {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&message.data[..8]);
+                Ok(Some(Dm5::decode(&bytes)))
+            }
+            Response::Message(message) => Err(invalid_input(format!(
+                "DM5 from {} was {} bytes, not 8",
+                target,
+                message.data.len()
+            ))),
+            Response::Acknowledged(ack) => refused(ack, "DM5"),
+            Response::TimedOut => Ok(None),
+        }
+    }
+
+    /// Read the software version strings `target` reports about itself.
+    ///
+    /// The fields are `*`-delimited on the wire; this splits them and drops the
+    /// leading count byte.
+    pub fn read_software_identification(
+        &mut self,
+        target: Address,
+        timeout: Duration,
+    ) -> io::Result<Option<Vec<String>>> {
+        match self.request_wait(target, pgn::SOFTWARE_IDENTIFICATION, timeout)? {
+            Response::Message(message) => {
+                let id = SoftwareIdentification::parse(&message.data).map_err(invalid_input)?;
+                Ok(Some(
+                    id.fields()
+                        .map(|field| String::from_utf8_lossy(field).into_owned())
+                        .collect(),
+                ))
+            }
+            Response::Acknowledged(ack) => refused(ack, "software identification"),
+            Response::TimedOut => Ok(None),
+        }
+    }
+
+    /// Ask `target` to clear its *active* trouble codes — a DM11 request.
+    ///
+    /// Returns whether it confirmed. `false` means it never answered; an error
+    /// means it refused, with the reason.
+    ///
+    /// # This is not a diagnostic step
+    ///
+    /// An active code is a fault happening now. Clearing it fixes nothing — the
+    /// ECU sets it again if the condition persists, and if it does not, the
+    /// evidence is gone. Read the codes first.
+    pub fn clear_active_faults(&mut self, target: Address, timeout: Duration) -> io::Result<bool> {
+        self.clear_with(target, pgn::DM11, timeout)
+    }
+
+    /// Ask `target` to clear its fault *history* — a DM3 request. See
+    /// [`Ecu::clear_active_faults`].
+    pub fn clear_previously_active_faults(
+        &mut self,
+        target: Address,
+        timeout: Duration,
+    ) -> io::Result<bool> {
+        self.clear_with(target, pgn::DM3, timeout)
+    }
+
+    fn clear_with(&mut self, target: Address, group: Pgn, timeout: Duration) -> io::Result<bool> {
+        match self.request_wait(target, group, timeout)? {
+            Response::Acknowledged(ack) if ack.control.is_positive() => Ok(true),
+            Response::Acknowledged(ack) => {
+                refused(ack, "the clear request").map(|_: Option<()>| false)
+            }
+            // DM3 and DM11 carry no data of their own, so a data message in
+            // reply is not an answer to this.
+            Response::Message(_) | Response::TimedOut => Ok(false),
+        }
+    }
+
     /// J1939-81 forbids transmitting from an address this ECU has not claimed.
     fn check_may_transmit(&self) -> io::Result<()> {
         if self.node.has_address() {
@@ -466,6 +874,16 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
 
     /// Feed one frame to the node and send whatever it asks for.
     fn dispatch(&mut self, frame: &Frame) -> io::Result<Option<Message>> {
+        // Record the claim before the node consumes it. A Cannot Claim
+        // announcement comes from the null address and names nobody, so it is
+        // not an inventory entry.
+        if frame.pgn() == pgn::ADDRESS_CLAIMED && frame.source_address().is_specific() {
+            self.inventory.insert(
+                frame.source_address().as_u8(),
+                Name::from_bytes(frame.payload()),
+            );
+        }
+
         if let Some(message) = self.dispatch_etp(frame)? {
             return Ok(message);
         }
@@ -506,6 +924,20 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
                 }
             }
         }
+
+        // A tool asking this ECU about its faults. `Node` passes requests up
+        // rather than answering them, because what an ECU can supply is an
+        // application question — but the diagnostic groups are ones this type
+        // owns the state for, so it answers them itself. The request is still
+        // returned to the caller, which may want to log it.
+        if let Some(message) = &message {
+            if message.pgn == pgn::REQUEST && self.node.has_address() {
+                if let Ok(request) = Request::decode(&message.data) {
+                    let requester = message.source;
+                    self.answer_diagnostic_request(requester, &request)?;
+                }
+            }
+        }
         Ok(message)
     }
 
@@ -539,8 +971,73 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
         for (peer, abort) in &expired {
             self.send_etp_cm(*peer, abort)?;
         }
+
+        // The periodic DM1, once a second while anything is wrong. Held back
+        // until the address is claimed: an ECU may not transmit before then,
+        // and consuming the fault log's timer meanwhile would throw the report
+        // away rather than delay it.
+        if self.node.has_address() && self.faults.tick(elapsed_ms) {
+            self.send_dm1()?;
+        }
         Ok(())
     }
+}
+
+/// What came back from [`Ecu::request_wait`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Response {
+    /// The parameter group that was asked for.
+    Message(Message),
+    /// The target answered with an acknowledgement instead — either confirming
+    /// an action that has no data to return, such as a DM11 clear, or declining
+    /// the request. Check
+    /// [`AckControl::is_positive`](sae_j1939_rs::request::AckControl::is_positive).
+    Acknowledged(Acknowledgement),
+    /// Nothing came back in time.
+    ///
+    /// Not necessarily a failure: J1939 has no "unsupported" reply that ECUs
+    /// are obliged to send, so silence is the usual answer to a request for a
+    /// parameter group an ECU does not implement.
+    TimedOut,
+}
+
+/// A fault list read from another ECU: what its lamps show, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultReport {
+    /// The lamp and flash status the ECU reported.
+    pub lamps: Lamps,
+    /// The trouble codes. Empty when the ECU reported none — the all-zero and
+    /// all-`0xFF` placeholders are filtered out, so this is only real faults.
+    pub dtcs: Vec<Dtc>,
+}
+
+impl FaultReport {
+    /// Whether the ECU reported nothing wrong.
+    pub fn is_healthy(&self) -> bool {
+        self.dtcs.is_empty()
+    }
+
+    fn parse(payload: &[u8]) -> io::Result<Self> {
+        let dm = diagnostics::Message::parse(payload).map_err(invalid_input)?;
+        Ok(FaultReport {
+            lamps: dm.lamps(),
+            dtcs: dm.dtcs().filter(|dtc| !dtc.is_no_fault()).collect(),
+        })
+    }
+}
+
+/// Turn a negative acknowledgement into an error carrying its reason.
+fn refused<T>(ack: Acknowledgement, what: &str) -> io::Result<T> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{} declined {what}: {:?}", ack.address.as_u8(), ack.control),
+    ))
+}
+
+/// DM5 gives each count a single byte. More faults than that is possible in
+/// principle and reportable only as "at least 255".
+fn saturating_count(count: usize) -> u8 {
+    u8::try_from(count).unwrap_or(u8::MAX)
 }
 
 fn invalid_input<E: ToString>(error: E) -> io::Error {
@@ -1377,5 +1874,553 @@ mod tests {
         assert_eq!(identification.part_number_str(), Some("PN-1234"));
         assert_eq!(identification.serial_number_str(), Some("SN-99"));
         assert_eq!(identification.manufacturer_name_str(), Some("ACME MOTORS"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Reporting this ECU's own faults.
+    // -----------------------------------------------------------------------
+
+    /// Bring an ECU up on a scripted bus, ready to transmit.
+    fn claimed_ecu() -> Ecu<FakeBus, 1785, 4> {
+        let mut ecu = ecu_on(FakeBus::default(), name_for(1, 100));
+        ecu.claim_address().unwrap();
+        assert!(ecu.has_address());
+        ecu
+    }
+
+    /// A Request frame from a service tool at 0xF9 to this ECU at 0x80.
+    fn request_frame(requested: Pgn) -> Frame {
+        let id = Id::from_parts(
+            Priority::DEFAULT,
+            pgn::REQUEST,
+            Address::new(0x80),
+            Address::new(0xF9),
+        )
+        .unwrap();
+        Frame::new(id, &Request::new(requested).encode()).unwrap()
+    }
+
+    /// Drive `poll` for a while, so timers actually fire.
+    fn run_for(ecu: &mut Ecu<FakeBus, 1785, 4>, duration: Duration) {
+        let deadline = Instant::now() + duration;
+        while Instant::now() < deadline {
+            ecu.poll().unwrap();
+        }
+    }
+
+    fn dm1_payloads(ecu: &Ecu<FakeBus, 1785, 4>) -> Vec<Vec<u8>> {
+        ecu.bus()
+            .sent_with_pgn(pgn::DM1)
+            .into_iter()
+            .map(|f| f.data().to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn a_healthy_ecu_never_broadcasts_dm1() {
+        let mut ecu = claimed_ecu();
+        run_for(&mut ecu, Duration::from_millis(1200));
+        assert!(
+            ecu.bus().sent_with_pgn(pgn::DM1).is_empty(),
+            "nothing is wrong, so there is nothing to broadcast"
+        );
+    }
+
+    #[test]
+    fn a_faulted_ecu_broadcasts_dm1_about_once_a_second() {
+        let mut ecu = claimed_ecu();
+        ecu.set_fault(100, 1, Lamp::RedStop).unwrap();
+
+        // The first report is prompt — a fault should not wait a second to be
+        // announced when nothing has been said recently.
+        run_for(&mut ecu, Duration::from_millis(50));
+        assert_eq!(dm1_payloads(&ecu).len(), 1);
+
+        // Then once per second, not once per poll.
+        run_for(&mut ecu, Duration::from_millis(1100));
+        let count = dm1_payloads(&ecu).len();
+        assert_eq!(count, 2, "expected one more DM1, got {count} in total");
+    }
+
+    #[test]
+    fn the_broadcast_dm1_carries_the_fault_and_lights_the_lamp() {
+        let mut ecu = claimed_ecu();
+        ecu.set_fault(100, 1, Lamp::RedStop).unwrap();
+        run_for(&mut ecu, Duration::from_millis(50));
+
+        let payload = dm1_payloads(&ecu).pop().expect("no DM1 was broadcast");
+        let dm = diagnostics::Message::parse(&payload).unwrap();
+        assert_eq!(dm.lamps().status(Lamp::RedStop), LampStatus::On);
+        assert_eq!(dm.lamps().status(Lamp::AmberWarning), LampStatus::Off);
+
+        let dtcs: Vec<Dtc> = dm.dtcs().collect();
+        assert_eq!(dtcs.len(), 1);
+        assert_eq!(dtcs[0].spn, 100);
+        assert_eq!(dtcs[0].fmi, 1);
+    }
+
+    #[test]
+    fn clearing_the_last_fault_broadcasts_one_all_clear_then_stops() {
+        let mut ecu = claimed_ecu();
+        ecu.set_fault(100, 1, Lamp::RedStop).unwrap();
+        run_for(&mut ecu, Duration::from_millis(50));
+        assert!(ecu.clear_fault(100, 1));
+
+        run_for(&mut ecu, Duration::from_millis(1100));
+        let payloads = dm1_payloads(&ecu);
+        assert_eq!(payloads.len(), 2, "the fault, then the all-clear");
+
+        let all_clear = diagnostics::Message::parse(payloads.last().unwrap()).unwrap();
+        assert!(all_clear.is_fault_free());
+        assert!(!all_clear.lamps().any_on(), "the lamps must go out");
+
+        // And then nothing: silence is only meaningful after the all-clear.
+        run_for(&mut ecu, Duration::from_millis(1100));
+        assert_eq!(dm1_payloads(&ecu).len(), 2);
+    }
+
+    #[test]
+    fn an_ecu_without_an_address_does_not_broadcast_dm1() {
+        // Never claimed: J1939-81 forbids transmitting, and the report must be
+        // held rather than thrown away.
+        let mut ecu = ecu_on(FakeBus::default(), name_for(1, 100));
+        ecu.set_fault(100, 1, Lamp::RedStop).unwrap();
+        run_for(&mut ecu, Duration::from_millis(1200));
+        assert!(ecu.bus().sent_with_pgn(pgn::DM1).is_empty());
+
+        // Once it is on the bus, the fault is reported — not lost.
+        ecu.claim_address().unwrap();
+        run_for(&mut ecu, Duration::from_millis(50));
+        assert_eq!(dm1_payloads(&ecu).len(), 1);
+    }
+
+    #[test]
+    fn several_faults_go_out_over_the_transport_protocol() {
+        let mut ecu = claimed_ecu();
+        ecu.set_fault(100, 1, Lamp::RedStop).unwrap();
+        ecu.set_fault(110, 0, Lamp::AmberWarning).unwrap();
+        ecu.set_fault(190, 16, Lamp::Protect).unwrap();
+        run_for(&mut ecu, Duration::from_millis(300));
+
+        // Fourteen bytes will not fit a frame, so it is announced with a BAM
+        // and pushed as data packets — no plain DM1 frame at all.
+        assert!(ecu.bus().sent_with_pgn(pgn::DM1).is_empty());
+        let announcements = ecu.bus().sent_with_pgn(pgn::TP_CM);
+        assert_eq!(announcements.len(), 1);
+        assert_eq!(
+            ecu.bus().sent_with_pgn(pgn::TP_DT).len(),
+            2,
+            "fourteen bytes is two data packets"
+        );
+
+        // And the announcement names DM1, so a receiver knows what is coming.
+        let TpCm::Bam {
+            size, pgn: group, ..
+        } = TpCm::decode(announcements[0].payload()).unwrap()
+        else {
+            panic!("a broadcast transfer must be announced with a BAM");
+        };
+        assert_eq!(group, pgn::DM1);
+        assert_eq!(size, 14);
+    }
+
+    #[test]
+    fn a_request_for_dm1_is_answered_with_the_active_faults() {
+        let mut ecu = claimed_ecu();
+        ecu.set_fault(100, 1, Lamp::RedStop).unwrap();
+        // Drain the periodic broadcast so the next DM1 is unambiguously the
+        // answer to the request.
+        run_for(&mut ecu, Duration::from_millis(50));
+        let before = dm1_payloads(&ecu).len();
+
+        ecu.bus().queue(request_frame(pgn::DM1));
+        ecu.poll().unwrap();
+
+        let payloads = dm1_payloads(&ecu);
+        assert_eq!(payloads.len(), before + 1, "the request went unanswered");
+        let dm = diagnostics::Message::parse(payloads.last().unwrap()).unwrap();
+        assert_eq!(dm.dtcs().next().unwrap().spn, 100);
+    }
+
+    #[test]
+    fn a_healthy_ecu_still_answers_a_request_for_dm1() {
+        // Silence would be indistinguishable from an ECU that is not there.
+        let mut ecu = claimed_ecu();
+        ecu.bus().queue(request_frame(pgn::DM1));
+        ecu.poll().unwrap();
+
+        let payloads = dm1_payloads(&ecu);
+        assert_eq!(payloads.len(), 1);
+        assert!(diagnostics::Message::parse(&payloads[0])
+            .unwrap()
+            .is_fault_free());
+    }
+
+    #[test]
+    fn a_request_for_dm2_is_answered_with_the_history() {
+        let mut ecu = claimed_ecu();
+        ecu.set_fault(100, 1, Lamp::RedStop).unwrap();
+        ecu.clear_fault(100, 1);
+        run_for(&mut ecu, Duration::from_millis(50));
+
+        ecu.bus().queue(request_frame(pgn::DM2));
+        ecu.poll().unwrap();
+
+        let sent = ecu.bus().sent_with_pgn(pgn::DM2);
+        assert_eq!(sent.len(), 1);
+        let dm = diagnostics::Message::parse(sent[0].data()).unwrap();
+        assert_eq!(dm.dtcs().next().unwrap().spn, 100);
+        assert!(!dm.lamps().any_on(), "history lights no lamps");
+    }
+
+    #[test]
+    fn dm11_clears_the_active_codes_and_is_acknowledged_to_the_requester() {
+        let mut ecu = claimed_ecu();
+        ecu.set_fault(100, 1, Lamp::RedStop).unwrap();
+        run_for(&mut ecu, Duration::from_millis(50));
+
+        ecu.bus().queue(request_frame(pgn::DM11));
+        ecu.poll().unwrap();
+
+        assert!(ecu.faults().is_healthy(), "the codes should be gone");
+        // A reset command is not evidence the fault stopped, so no history.
+        assert!(ecu.faults().previously_active().is_empty());
+
+        let acks = ecu.bus().sent_with_pgn(pgn::ACKNOWLEDGEMENT);
+        assert_eq!(acks.len(), 1);
+        assert_eq!(
+            acks[0].id().destination_address(),
+            Some(Address::new(0xF9)),
+            "the requester asked, so the requester is told"
+        );
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(acks[0].payload());
+        let ack = Acknowledgement::decode(&bytes);
+        assert!(ack.control.is_positive());
+        assert_eq!(ack.pgn, pgn::DM11);
+
+        // The lamps going out is announced rather than left to be inferred.
+        let last = dm1_payloads(&ecu).pop().unwrap();
+        assert!(diagnostics::Message::parse(&last).unwrap().is_fault_free());
+    }
+
+    #[test]
+    fn dm3_clears_the_history_and_leaves_live_faults_alone() {
+        let mut ecu = claimed_ecu();
+        ecu.set_fault(100, 1, Lamp::RedStop).unwrap();
+        ecu.clear_fault(100, 1);
+        ecu.set_fault(110, 0, Lamp::AmberWarning).unwrap();
+        run_for(&mut ecu, Duration::from_millis(50));
+
+        ecu.bus().queue(request_frame(pgn::DM3));
+        ecu.poll().unwrap();
+
+        assert!(ecu.faults().previously_active().is_empty());
+        assert_eq!(ecu.faults().active().len(), 1, "DM3 spares live faults");
+
+        let acks = ecu.bus().sent_with_pgn(pgn::ACKNOWLEDGEMENT);
+        assert_eq!(acks.len(), 1);
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(acks[0].payload());
+        assert_eq!(Acknowledgement::decode(&bytes).pgn, pgn::DM3);
+    }
+
+    #[test]
+    fn a_request_for_dm5_reports_counts_that_match_the_fault_log() {
+        let mut ecu = claimed_ecu();
+        ecu.set_fault(100, 1, Lamp::RedStop).unwrap();
+        ecu.set_fault(110, 0, Lamp::AmberWarning).unwrap();
+        ecu.clear_fault(100, 1);
+        ecu.set_fault(190, 16, Lamp::Protect).unwrap();
+        run_for(&mut ecu, Duration::from_millis(300));
+
+        ecu.bus().queue(request_frame(pgn::DM5));
+        run_for(&mut ecu, Duration::from_millis(20));
+
+        let sent = ecu.bus().sent_with_pgn(pgn::DM5);
+        assert_eq!(sent.len(), 1);
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(sent[0].payload());
+        let readiness = diagnostics::Dm5::decode(&bytes);
+
+        // Two active (110, 190) and one previously active (100) — the same
+        // numbers the DM1 and DM2 would report, because they share a source.
+        assert_eq!(readiness.active_faults, 2);
+        assert_eq!(readiness.previously_active_faults, 1);
+        assert_eq!(readiness.obd_compliance, ObdCompliance::NotIntended);
+    }
+
+    #[test]
+    fn an_ecu_reports_the_compliance_level_it_was_given() {
+        let mut ecu = claimed_ecu();
+        ecu.set_obd_compliance(ObdCompliance::Other(0x14));
+        ecu.bus().queue(request_frame(pgn::DM5));
+        run_for(&mut ecu, Duration::from_millis(20));
+
+        let sent = ecu.bus().sent_with_pgn(pgn::DM5);
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(sent[0].payload());
+        assert_eq!(
+            diagnostics::Dm5::decode(&bytes).obd_compliance,
+            ObdCompliance::Other(0x14)
+        );
+    }
+
+    #[test]
+    fn a_request_for_something_else_is_left_to_the_application() {
+        let mut ecu = claimed_ecu();
+        ecu.bus()
+            .queue(request_frame(pgn::COMPONENT_IDENTIFICATION));
+
+        let message = ecu.poll().unwrap().expect("the request must reach us");
+        assert_eq!(message.pgn, pgn::REQUEST);
+        // Not ours to answer, and specifically not answered with a wrong guess.
+        assert!(ecu.bus().sent_with_pgn(pgn::DM1).is_empty());
+        assert!(ecu.bus().sent_with_pgn(pgn::ACKNOWLEDGEMENT).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Reading another ECU's faults: the service-tool side.
+    // -----------------------------------------------------------------------
+
+    /// A DM1 broadcast by the engine ECU at 0x00.
+    fn dm1_from_engine(lamps: Lamps, dtcs: &[Dtc]) -> Frame {
+        let mut payload = [0u8; 8];
+        let len = diagnostics::encode(lamps, dtcs, &mut payload).unwrap();
+        assert_eq!(len, 8, "this helper only builds single-frame DM1s");
+        Frame::from_payload(
+            Id::broadcast(Priority::DEFAULT, pgn::DM1, Address::new(0x00)),
+            payload,
+        )
+    }
+
+    #[test]
+    fn the_tool_reads_a_fault_list_back() {
+        let mut tool = claimed_ecu();
+        let lamps = Lamps::new().with_status(Lamp::AmberWarning, LampStatus::On);
+        tool.bus()
+            .queue(dm1_from_engine(lamps, &[Dtc::new(1569, 31, 4).unwrap()]));
+
+        let report = tool
+            .read_active_faults(Address::new(0x00), DIAGNOSTIC_TIMEOUT)
+            .unwrap()
+            .expect("the engine answered");
+
+        assert_eq!(report.lamps, lamps);
+        assert_eq!(report.dtcs.len(), 1);
+        assert_eq!(report.dtcs[0].spn, 1569);
+        assert_eq!(report.dtcs[0].occurrence_count, 4);
+        assert!(!report.is_healthy());
+    }
+
+    #[test]
+    fn a_fault_free_answer_reads_as_healthy_rather_than_as_a_code() {
+        let mut tool = claimed_ecu();
+        // The placeholder a real ECU sends when nothing is wrong.
+        tool.bus()
+            .queue(dm1_from_engine(Lamps::new(), &[Dtc::default()]));
+
+        let report = tool
+            .read_active_faults(Address::new(0x00), DIAGNOSTIC_TIMEOUT)
+            .unwrap()
+            .unwrap();
+        assert!(report.is_healthy());
+        assert!(report.dtcs.is_empty(), "a placeholder is not a fault");
+    }
+
+    #[test]
+    fn an_ecu_that_says_nothing_reads_as_no_answer() {
+        let mut tool = claimed_ecu();
+        let answer = tool
+            .read_active_faults(Address::new(0x00), Duration::from_millis(120))
+            .unwrap();
+        assert!(answer.is_none(), "silence is not a fault list");
+        // And the request did go out, so this is a timeout rather than a no-op.
+        assert_eq!(tool.bus().sent_with_pgn(pgn::REQUEST).len(), 1);
+    }
+
+    #[test]
+    fn an_answer_from_the_wrong_ecu_is_not_mistaken_for_ours() {
+        let mut tool = claimed_ecu();
+        // 0x03 volunteers a DM1 while we are waiting on 0x00.
+        tool.bus().queue(Frame::from_payload(
+            Id::broadcast(Priority::DEFAULT, pgn::DM1, Address::new(0x03)),
+            [0x00, 0x00, 0x64, 0x00, 0x01, 0x81, 0xFF, 0xFF],
+        ));
+
+        let answer = tool
+            .read_active_faults(Address::new(0x00), Duration::from_millis(120))
+            .unwrap();
+        assert!(answer.is_none());
+
+        // But it was not swallowed: the application still gets to see it.
+        let queued = tool.poll().unwrap().expect("the other DM1 must survive");
+        assert_eq!(queued.source, Address::new(0x03));
+        assert_eq!(queued.pgn, pgn::DM1);
+    }
+
+    #[test]
+    fn a_refusal_is_reported_as_a_refusal_rather_than_as_silence() {
+        let mut tool = claimed_ecu();
+        let ack = diagnostics::dm11::refuse(
+            Address::new(0x00),
+            sae_j1939_rs::request::AckControl::AccessDenied,
+        );
+        let id = Id::from_parts(
+            Priority::DEFAULT,
+            pgn::ACKNOWLEDGEMENT,
+            Address::new(0x80),
+            Address::new(0x00),
+        )
+        .unwrap();
+        tool.bus().queue(Frame::from_payload(id, ack.encode()));
+
+        let error = tool
+            .clear_active_faults(Address::new(0x00), DIAGNOSTIC_TIMEOUT)
+            .expect_err("a denial is not success");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn a_positive_acknowledgement_confirms_the_clear() {
+        let mut tool = claimed_ecu();
+        let ack = diagnostics::dm3::acknowledge(Address::new(0x00));
+        let id = Id::from_parts(
+            Priority::DEFAULT,
+            pgn::ACKNOWLEDGEMENT,
+            Address::new(0x80),
+            Address::new(0x00),
+        )
+        .unwrap();
+        tool.bus().queue(Frame::from_payload(id, ack.encode()));
+
+        assert!(tool
+            .clear_previously_active_faults(Address::new(0x00), DIAGNOSTIC_TIMEOUT)
+            .unwrap());
+    }
+
+    #[test]
+    fn every_address_claim_heard_becomes_an_inventory_entry() {
+        let mut tool = claimed_ecu();
+        assert_eq!(tool.inventory().count(), 0, "nothing heard yet");
+
+        tool.bus()
+            .queue(claim_frame(Address::new(0x00), name_for(7, 700)));
+        tool.bus()
+            .queue(claim_frame(Address::new(0x03), name_for(8, 800)));
+        run_for(&mut tool, Duration::from_millis(30));
+
+        let inventory: Vec<_> = tool.inventory().collect();
+        assert_eq!(inventory.len(), 2);
+        // Address order, so a scan reads the way a bus is usually drawn.
+        assert_eq!(inventory[0].0, Address::new(0x00));
+        assert_eq!(inventory[0].1.manufacturer_code(), 700);
+        assert_eq!(inventory[1].0, Address::new(0x03));
+    }
+
+    #[test]
+    fn an_ecu_that_gave_up_is_not_an_inventory_entry() {
+        let mut tool = claimed_ecu();
+        // A Cannot Claim announcement comes from the null address: it says
+        // somebody lost, not that anybody is there.
+        tool.bus()
+            .queue(claim_frame(Address::NULL, name_for(9, 900)));
+        run_for(&mut tool, Duration::from_millis(30));
+        assert_eq!(tool.inventory().count(), 0);
+    }
+
+    #[test]
+    fn a_scan_asks_the_bus_who_is_there() {
+        let mut tool = claimed_ecu();
+        tool.bus()
+            .queue(claim_frame(Address::new(0x21), name_for(7, 700)));
+
+        let found = tool.scan(Duration::from_millis(60)).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, Address::new(0x21));
+
+        // It really did ask, rather than only listening.
+        let requests = tool.bus().sent_with_pgn(pgn::REQUEST);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].id().destination_address(),
+            Some(Address::GLOBAL)
+        );
+        assert_eq!(
+            Request::decode(requests[0].data()).unwrap().pgn,
+            pgn::ADDRESS_CLAIMED
+        );
+    }
+
+    /// The whole point of the chunk: a tool and a faulted ECU, both real, one
+    /// asking and the other answering over a shared wire.
+    #[test]
+    fn a_tool_reads_and_clears_a_real_ecus_faults() {
+        let tool_address = Address::new(0xF9);
+        let ecu_address = Address::new(0x90);
+        let patience = Duration::from_secs(10);
+
+        let (tool_end, ecu_end) = link_ends();
+
+        // An engine controller with two things wrong with it.
+        let engine = std::thread::spawn(move || -> io::Result<()> {
+            let mut ecu = Ecu::<_, 1785, 4>::new(ecu_end, name_for(2, 200), ecu_address);
+            ecu.claim_address()?;
+            assert!(ecu.has_address(), "the engine never claimed an address");
+            ecu.set_fault(100, 1, Lamp::RedStop).unwrap();
+            ecu.set_fault(110, 0, Lamp::AmberWarning).unwrap();
+
+            // Just run. Everything the tool asks for is answered inside `poll`.
+            let deadline = Instant::now() + patience;
+            while Instant::now() < deadline && !ecu.faults().is_healthy() {
+                ecu.poll()?;
+            }
+            assert!(
+                ecu.faults().is_healthy(),
+                "the tool never cleared the codes"
+            );
+            Ok(())
+        });
+
+        let mut tool = Ecu::<_, 1785, 4>::new(tool_end, name_for(1, 100), tool_address);
+        tool.claim_address().unwrap();
+        assert!(tool.has_address(), "the tool never claimed an address");
+
+        // What is on this bus? The engine must answer the global request for
+        // Address Claimed with its NAME.
+        let found = tool.scan(Duration::from_secs(1)).unwrap();
+        assert_eq!(found.len(), 1, "the scan should have found the engine");
+        assert_eq!(found[0].0, ecu_address);
+        assert_eq!(found[0].1.manufacturer_code(), 200);
+
+        // Readiness first, the way a technician works: how many codes to expect
+        // before reading them.
+        let readiness = tool
+            .read_readiness(ecu_address, patience)
+            .unwrap()
+            .expect("the engine never reported its readiness");
+        assert_eq!(readiness.active_faults, 2);
+        assert_eq!(readiness.previously_active_faults, 0);
+
+        // Two faults means the answer arrives over the transport protocol.
+        let report = tool
+            .read_active_faults(ecu_address, patience)
+            .unwrap()
+            .expect("the engine never reported its faults");
+        let spns: Vec<u32> = report.dtcs.iter().map(|d| d.spn).collect();
+        assert_eq!(spns, [100, 110], "in the order they were raised");
+        assert_eq!(report.lamps.status(Lamp::RedStop), LampStatus::On);
+        assert_eq!(report.lamps.status(Lamp::AmberWarning), LampStatus::On);
+
+        // Now clear them, and watch the ECU confirm.
+        assert!(
+            tool.clear_active_faults(ecu_address, patience).unwrap(),
+            "the engine did not acknowledge the clear"
+        );
+
+        engine
+            .join()
+            .expect("the engine thread panicked")
+            .expect("the engine hit an I/O error");
     }
 }

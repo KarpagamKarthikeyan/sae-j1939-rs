@@ -7,7 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-04
+
+Additive throughout: no breaking changes since 0.3.0.
+
+Diagnostics stopped being only a codec. Until now the crate could turn trouble
+codes into bytes and back, which is the whole job for reading someone else's
+faults but not for having your own: an ECU has to remember which faults are
+active, how many times each has occurred, which lamps they light, and when the
+next DM1 is due. Both sides of that exchange now work end to end.
+
 ### Added
+
+- `fault_log` (core) — **`FaultLog<N>`**, the fault state an ECU reports about
+  itself. `no_std`, allocation-free, and owning neither a bus nor a clock, so
+  the same type runs on a microcontroller and under a test.
+  - Two bounded lists mirroring the wire: active codes become DM1, previously
+    active ones DM2. Retiring a fault moves it between them.
+  - Occurrence counts follow J1939-73: they move only on an inactive-to-active
+    transition, so re-asserting a live fault every control cycle does not
+    inflate the count, and a fault that clears and returns resumes where it left
+    off, saturating rather than wrapping.
+  - `tick` says when a DM1 is due — once a second while anything is active, once
+    more when the last fault clears so a tool sees the lamps go out rather than
+    just losing the signal, then nothing.
+  - A full active list refuses the newest fault; a full history drops its oldest
+    entry. Different rules on purpose: in a cascade the first fault is usually
+    the cause, while a technician is diagnosing the recent past.
+  - `clear_active` (DM11) erases codes without recording them as history. A
+    reset command is not evidence that a condition stopped.
+- An **ECU that reports itself** (host). `Ecu` owns a `FaultLog` and drives it:
+  - `set_fault` / `clear_fault`, and `faults()` / `faults_mut()` for the rest.
+  - The periodic DM1 goes out from `poll`, over the transport protocol when the
+    fault list exceeds one frame, held back until an address is claimed so a
+    report is delayed rather than discarded.
+  - Requests for **DM1, DM2 and DM5** are answered, and **DM3** and **DM11**
+    honoured with an acknowledgement — addressed to the requester, matching what
+    the [Open-SAE-J1939][ref] C reference does. DM5's counts come from the same fault
+    log, so they cannot drift out of step with the DM1 beside them.
+  - `set_obd_compliance`, defaulting to "not intended to meet OBD requirements".
+    The crate cannot know, and guessing would put a compliance claim on the bus
+    that nobody stands behind.
+- A **tool that reads another ECU** (host):
+  - `request_wait` — the blocking counterpart to `request`, and the primitive
+    the rest are built on. Traffic arriving meanwhile is queued for `poll`
+    rather than dropped; messages queued *before* the request are left alone,
+    since something that arrived earlier cannot be the answer to it.
+  - `read_active_faults`, `read_previously_active_faults`, `read_readiness`,
+    `read_software_identification`, `clear_active_faults`,
+    `clear_previously_active_faults`.
+  - `Ok(None)` means no answer, which on J1939 is the usual way of saying a
+    parameter group is unsupported; a refusal is an `Unsupported` error carrying
+    its reason. Silence and "no" stay distinguishable.
+- `Ecu::inventory` and `Ecu::scan` — who is on the bus, and what NAME they
+  claimed. `Node` treats address claims as network management and never passes
+  them up, so a tool could not previously answer the first question anyone asks
+  of a bus.
+- `service_tool` example — the counterpart to `vcan_ecu`: scan a bus, read an
+  ECU's readiness, faults, history and software version, and optionally clear.
+- `mcu_node` and `vcan_ecu` examples now drive a real fault lifecycle, including
+  a fault clearing mid-run, instead of a hardcoded payload.
+
+### Fixed
+
+- `Dtc::is_no_fault` recognises the **all-`0xFF`** placeholder as well as the
+  all-zero one. Many ECUs pad a fault-free DM1 with `0xFF`, which decodes to
+  SPN `0x7FFFF` / FMI 31 — neither value assignable — and the crate reported
+  that as a real fault. It also meant `encode`'s own fault-free output did not
+  read back as fault-free.
+
+### Added (previously unreleased)
 
 - `log` (host) — read `candump` captures and replay them through the stack.
   Three modules (`etp`, `iso11783::working_set`, `iso11783::task_controller`)
@@ -359,7 +428,9 @@ peer belonged to the transfer in hand.
   (including a licensing-provenance checkbox), and CI covering tests, lint,
   docs, `no_std`, MSRV 1.75, and an on-bus decode.
 
-[Unreleased]: https://github.com/KarpagamKarthikeyan/sae-j1939-rs/compare/v0.3.0...HEAD
+[ref]: https://github.com/DanielMartensson/Open-SAE-J1939
+[Unreleased]: https://github.com/KarpagamKarthikeyan/sae-j1939-rs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/KarpagamKarthikeyan/sae-j1939-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/KarpagamKarthikeyan/sae-j1939-rs/compare/v0.2.0...v0.3.0
 [0.1.0]: https://github.com/KarpagamKarthikeyan/sae-j1939-rs/releases/tag/v0.1.0
 

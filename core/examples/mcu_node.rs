@@ -32,7 +32,8 @@ use core::cell::RefCell;
 use embedded_can::Id as CanId;
 
 use sae_j1939_rs::can::{decode, encode};
-use sae_j1939_rs::diagnostics::{self, Dtc, Lamp, LampStatus, Lamps};
+use sae_j1939_rs::diagnostics::Lamp;
+use sae_j1939_rs::fault_log::FaultLog;
 use sae_j1939_rs::node::{Event, Node, Outgoing, ADDRESS_CLAIM_WINDOW_MS};
 use sae_j1939_rs::request::Request;
 use sae_j1939_rs::{name::industry_group, pgn, Address, Frame, Name};
@@ -48,6 +49,15 @@ const MAX_MESSAGE: usize = 128;
 /// `MAX_MESSAGE` bytes.
 const PEERS: usize = 2;
 
+/// How many distinct faults this ECU can report at once. Size it for what the
+/// firmware can *detect*, not what you expect to happen: one broken connector
+/// sets several at a time.
+const MAX_FAULTS: usize = 8;
+
+/// Room for the longest DM1 this ECU can produce: two lamp bytes plus four per
+/// code. Fixed at compile time, like everything else here.
+const DM1_BUFFER: usize = 2 + 4 * MAX_FAULTS;
+
 fn main() {
     // ---- Identity -------------------------------------------------------
     let name = Name::new()
@@ -60,17 +70,14 @@ fn main() {
     let mut node = Node::<MAX_MESSAGE, PEERS>::new(name, Address::new(0x80));
     let can = MockCan::default();
 
-    // ---- Faults this ECU would report ------------------------------------
-    // Built into a fixed buffer, no allocation. Three codes exceed one frame,
-    // so answering a request for them takes the transport protocol.
-    let lamps = Lamps::new().with_status(Lamp::AmberWarning, LampStatus::On);
-    let faults = [
-        Dtc::new(100, 1, 2).unwrap(),
-        Dtc::new(110, 0, 5).unwrap(),
-        Dtc::new(1569, 31, 126).unwrap(),
-    ];
-    let mut dm1 = [0u8; 32];
-    let dm1_len = diagnostics::encode(lamps, &faults, &mut dm1).unwrap();
+    // ---- What is wrong with this ECU -------------------------------------
+    // The fault log owns no bus and no clock, so it belongs here in the
+    // application rather than inside `Node`. Raise and clear codes as the
+    // firmware detects conditions; it works out the lamps, the occurrence
+    // counts, and when the next DM1 is due.
+    let mut faults = FaultLog::<MAX_FAULTS>::new();
+    faults.set(100, 1, Lamp::RedStop).unwrap(); // oil pressure low
+    faults.set(110, 0, Lamp::AmberWarning).unwrap(); // coolant temperature high
 
     // ---- Start up --------------------------------------------------------
     transmit(&can, &node.start());
@@ -78,14 +85,15 @@ fn main() {
 
     // Stand-in for a SysTick counter. On real hardware this comes from a timer.
     let mut elapsed_ms: u16 = 0;
-    let tick_ms: u16 = 10;
+    let tick_ms: u16 = 25;
 
     // A scripted bus, so the example does something. On hardware these frames
     // arrive from the CAN peripheral.
     let mut asked = false;
+    let mut repaired = false;
 
     // ---- Main loop -------------------------------------------------------
-    for _ in 0..64 {
+    for _ in 0..160 {
         // 1. Drain the receive path.
         while let Some(frame) = receive(&can) {
             let mut answer_dm1 = false;
@@ -118,7 +126,8 @@ fn main() {
 
             // 2. Application work, once the borrow of `node` has ended.
             if answer_dm1 && node.has_address() {
-                broadcast_dm1(&can, node.address(), &dm1[..dm1_len]);
+                println!("  answering the request");
+                broadcast_dm1(&can, node.address(), &faults);
             }
         }
 
@@ -138,6 +147,22 @@ fn main() {
             println!("\na diagnostic tool asks for our active trouble codes:");
             can.inject(request_frame(pgn::DM1, node.address(), Address::new(0xF9)));
         }
+
+        // 4. The periodic DM1. The same timer drives it: the fault log says
+        //    when one is due — once a second while anything is active, once
+        //    more when the last code clears, then nothing.
+        if node.has_address() && faults.tick(tick_ms) {
+            print!("  [{elapsed_ms:>4} ms] periodic ");
+            broadcast_dm1(&can, node.address(), &faults);
+        }
+
+        // The oil pressure recovers two seconds in. The code stops being
+        // active, becomes history for DM2, and the red lamp goes out.
+        if elapsed_ms >= 2000 && !repaired {
+            repaired = true;
+            faults.clear(100, 1);
+            println!("\noil pressure recovered — SPN 100 is no longer active");
+        }
     }
 
     println!("\n{} frames transmitted", can.sent.borrow().len());
@@ -148,12 +173,20 @@ fn main() {
 /// `Outgoing` decides whether this fits one frame or needs the transport
 /// protocol, and hands back frames either way — the caller never builds a TP.CM
 /// or a TP.DT by hand.
-fn broadcast_dm1(can: &MockCan, source: Address, payload: &[u8]) {
-    let mut tx =
-        Outgoing::new(pgn::DM1, source, Address::GLOBAL, payload).expect("a valid message size");
+fn broadcast_dm1(can: &MockCan, source: Address, faults: &FaultLog<MAX_FAULTS>) {
+    // A fixed buffer on the stack, sized at compile time. No allocation, and no
+    // way for a long fault list to overrun it.
+    let mut payload = [0u8; DM1_BUFFER];
+    let len = faults
+        .dm1(&mut payload)
+        .expect("DM1_BUFFER is large enough");
+
+    let mut tx = Outgoing::new(pgn::DM1, source, Address::GLOBAL, &payload[..len])
+        .expect("a valid message size");
 
     println!(
-        "  tx DM1 with 3 trouble codes in {} frames{}",
+        "tx DM1: {} active code(s) in {} frame(s){}",
+        faults.active().len(),
         tx.frame_count(),
         if tx.needs_pacing() { " (paced)" } else { "" }
     );

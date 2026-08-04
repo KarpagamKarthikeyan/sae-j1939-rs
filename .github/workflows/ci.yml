@@ -132,6 +132,43 @@ jobs:
             || { echo "FAIL: no TP.DT packets carrying the DM1"; exit 1; }
           echo "PASS: address claimed and a multi-packet DM1 was broadcast"
 
+      # Both halves of the diagnostic exchange, as two separate processes on one
+      # bus: an ECU that has faults, and the tool that reads and clears them.
+      # Nothing here is mocked — the frames go through the kernel.
+      - name: A service tool reads and clears a real ECU's faults
+        run: |
+          set -euo pipefail
+          candump -L vcan0 > /tmp/tool-bus.log &
+          CANDUMP=$!
+          ./target/debug/examples/vcan_ecu vcan0 > /tmp/faulted-ecu.log 2>&1 &
+          ECU=$!
+          sleep 2
+
+          timeout 40 ./target/debug/examples/service_tool vcan0 \
+            --target 0x80 --clear > /tmp/tool.log 2>&1 || true
+          sleep 2
+
+          kill $ECU $CANDUMP 2>/dev/null || true
+          sleep 1
+          echo "----- tool output -----"; cat /tmp/tool.log
+          echo "----- ECU output -----"; cat /tmp/faulted-ecu.log
+
+          # The scan must have found the ECU and read back its NAME — not just
+          # printed the address it was told to target.
+          grep -q "NAME mfr=300 id=4242" /tmp/tool.log \
+            || { echo "FAIL: the scan did not find the ECU's NAME"; exit 1; }
+          # ...read its three faults back out of the multi-packet DM1...
+          grep -q "SPN 100 FMI 1" /tmp/tool.log \
+            || { echo "FAIL: SPN 100 not read back"; exit 1; }
+          grep -q "SPN 1569 FMI 31" /tmp/tool.log \
+            || { echo "FAIL: SPN 1569 not read back"; exit 1; }
+          # ...and the ECU must have honoured the clear.
+          grep -q "active codes (DM11): cleared" /tmp/tool.log \
+            || { echo "FAIL: the DM11 clear was not acknowledged"; exit 1; }
+          grep -q "a tool cleared the active codes" /tmp/faulted-ecu.log \
+            || { echo "FAIL: the ECU did not actually clear its codes"; exit 1; }
+          echo "PASS: faults read over TP and cleared, end to end"
+
       - name: The traffic decoder reads a live engine frame
         run: |
           set -euo pipefail

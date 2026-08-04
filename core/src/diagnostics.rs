@@ -323,10 +323,25 @@ impl Dtc {
         })
     }
 
-    /// Whether this is the placeholder an ECU sends when it has no faults:
-    /// SPN 0, FMI 0.
+    /// Whether this is a placeholder rather than a real fault.
+    ///
+    /// Two encodings mean "nothing to report", and both turn up on real buses:
+    ///
+    /// - **All zero** — SPN 0, FMI 0. What J1939-73 specifies, and what
+    ///   [`crate::fault_log::FaultLog`] transmits.
+    /// - **All ones** — SPN `0x7FFFF`, FMI 31. Not a code at all, but what you
+    ///   get by reading the `0xFF` bytes an ECU pads a fault-free DM1 with.
+    ///   Neither value is assignable, so this cannot collide with a real fault.
+    ///
+    /// ```
+    /// use sae_j1939_rs::diagnostics::Dtc;
+    ///
+    /// assert!(Dtc::decode(&[0x00, 0x00, 0x00, 0x00]).is_no_fault());
+    /// assert!(Dtc::decode(&[0xFF, 0xFF, 0xFF, 0xFF]).is_no_fault());
+    /// assert!(!Dtc::new(100, 1, 1).unwrap().is_no_fault());
+    /// ```
     pub const fn is_no_fault(&self) -> bool {
-        self.spn == 0 && self.fmi == 0
+        (self.spn == 0 && self.fmi == 0) || (self.spn == MAX_SPN && self.fmi == MAX_FMI)
     }
 
     /// Encode to four bytes.
@@ -1252,6 +1267,13 @@ mod tests {
         let len = encode(Lamps::new(), &[], &mut buf).unwrap();
         assert_eq!(len, 8, "must fill a CAN frame even with no faults");
         assert_eq!(buf, [0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+
+        // And reading it back must not invent a fault out of the padding —
+        // 0xFF bytes decode to the all-ones "not available" code, which plenty
+        // of real ECUs put in a fault-free DM1.
+        let dm = Message::parse(&buf).unwrap();
+        assert_eq!(dm.dtc_count(), 1);
+        assert!(dm.is_fault_free());
 
         // With no DTC bytes at all there is nothing to report.
         let dm = Message::parse(&[0, 0]).unwrap();

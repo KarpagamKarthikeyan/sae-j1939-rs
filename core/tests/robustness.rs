@@ -18,7 +18,8 @@
 //! reproducible from the seed printed in the assertion.
 
 use sae_j1939_rs::address_claim::AddressClaimer;
-use sae_j1939_rs::diagnostics::{self, Dtc, Lamps};
+use sae_j1939_rs::diagnostics::{self, Dtc, Lamp, Lamps};
+use sae_j1939_rs::fault_log::FaultLog;
 use sae_j1939_rs::identification::{
     self, ComponentIdentification, EcuIdentification, SoftwareIdentification,
 };
@@ -33,6 +34,9 @@ use sae_j1939_rs::request::{Acknowledgement, Request};
 use sae_j1939_rs::spn::Spn;
 use sae_j1939_rs::tp::{Reassembler, TpCm, TpDt};
 use sae_j1939_rs::{Address, Frame, Id, Name, Pgn};
+
+/// Every lamp, so the fuzz picks among real values rather than a fixed one.
+const LAMPS: [Lamp; 4] = Lamp::ALL;
 
 /// A deterministic generator, so any failure reproduces from its seed.
 struct Rng(u64);
@@ -296,6 +300,93 @@ fn node_dispatch_never_panics_on_arbitrary_frames() {
             address.is_specific() || address.is_null(),
             "address became {:#04x}: round {round}, seed {seed:#018x}",
             address.as_u8()
+        );
+    }
+}
+
+/// The fault log, driven by an arbitrary sequence of operations.
+///
+/// A decoder is fed one input at a time and can be checked in isolation; a
+/// state machine cannot. The invariants that matter here are the ones a wrong
+/// sequence would break silently: a list longer than its capacity, the same
+/// fault recorded twice, or a code that no longer fits the wire format it will
+/// be encoded into.
+#[test]
+fn the_fault_log_survives_any_sequence_of_operations() {
+    const CAPACITY: usize = 8;
+    let mut rng = Rng::new(0x0FA0_1939);
+    let mut faults = FaultLog::<CAPACITY>::new();
+    let mut buffer = [0u8; 2 + 4 * CAPACITY];
+
+    for round in 0..ROUNDS {
+        let seed = rng.0;
+
+        // A small pool of faults, so the same code is raised, cleared and
+        // raised again — which is where the state transitions live. Every
+        // eighth operation uses a fully arbitrary value instead, to keep the
+        // rejection paths exercised too.
+        let (spn, fmi) = if rng.u8() % 8 == 0 {
+            (rng.u32(), rng.u8())
+        } else {
+            ((rng.u8() % 12) as u32 + 100, rng.u8() % 4)
+        };
+
+        match rng.u8() % 8 {
+            // Mostly raise and clear, since those carry the interesting state.
+            0..=3 => {
+                let _ = faults.set(spn, fmi, LAMPS[(rng.u8() % 4) as usize]);
+            }
+            4..=5 => {
+                let _ = faults.clear(spn, fmi);
+            }
+            6 => {
+                let _ = faults.tick(rng.u8() as u16 * 8);
+            }
+            _ => match rng.u8() % 2 {
+                0 => faults.clear_active(),
+                _ => faults.clear_previously_active(),
+            },
+        }
+
+        let context = || format!("round {round}, seed {seed:#018x}");
+
+        assert!(
+            faults.active().len() <= CAPACITY && faults.previously_active().len() <= CAPACITY,
+            "a list outgrew its capacity: {}",
+            context()
+        );
+
+        // Identity is (SPN, FMI). A duplicate would be reported twice in one
+        // DM1, which a tool reads as two separate faults.
+        for (index, dtc) in faults.active().iter().enumerate() {
+            assert!(
+                !faults.active()[..index]
+                    .iter()
+                    .any(|other| other.spn == dtc.spn && other.fmi == dtc.fmi),
+                "duplicate active fault: {}",
+                context()
+            );
+            // Whatever went in must still fit the four bytes it goes out in.
+            assert_eq!(
+                Dtc::decode(&dtc.encode()),
+                *dtc,
+                "an active fault stopped round-tripping: {}",
+                context()
+            );
+        }
+
+        // And the encoders must always agree with the lengths they advertise.
+        assert_eq!(
+            faults.dm1(&mut buffer),
+            Ok(faults.dm1_len()),
+            "dm1 disagreed with dm1_len: {}",
+            context()
+        );
+        assert_eq!(
+            faults.dm2(&mut buffer),
+            Ok(faults.dm2_len()),
+            "dm2 disagreed with dm2_len: {}",
+            context()
         );
     }
 }
