@@ -21,7 +21,7 @@ does not own, and where the boundaries fall.
 6. [Transport protocol sequences](#6-transport-protocol-sequences)
 7. [Address claiming state machine](#7-address-claiming-state-machine)
 8. [Reassembler session model](#8-reassembler-session-model)
-9. [Diagnostic fault lifecycle](#9-diagnostic-fault-lifecycle)
+9. [Diagnostics and periodic transmission](#9-diagnostics-and-periodic-transmission)
 10. [Memory model](#10-memory-model)
 11. [Sans-I/O design rationale](#11-sans-io-design-rationale)
 12. [Error handling](#12-error-handling)
@@ -60,7 +60,7 @@ flowchart TB
 
     subgraph core["core: sae-j1939-rs (no_std)"]
         node["node::Node / node::Outgoing"]
-        proto["address_claim, tp, request, diagnostics,<br/>fault_log, memory_access, identification,<br/>iso11783, proprietary, spn"]
+        proto["address_claim, tp, request, diagnostics,<br/>fault_log, schedule, memory_access,<br/>identification, iso11783, proprietary, spn"]
         wire["id, pgn, frame, name, types"]
         canbridge["can<br/>embedded-can bridge"]
     end
@@ -125,6 +125,7 @@ follows it directly, so a module maps to a part you can look up.
 | `address_claim` | -81 | Claiming, defending, relocating, commanded address | `AddressClaimer`, `ClaimState`, `Claim`, `ClaimAction` |
 | `diagnostics` | -73 | DM1/DM2 trouble codes and lamp status, DM3 clear | `Lamps`, `Dtc`, `Message`, `dm3` |
 | `fault_log` | -73 | The fault state an ECU reports about *itself* | `FaultLog` |
+| `schedule` | -21 | Periodic transmission, and DM13 broadcast control | `Schedule`, `Due` |
 | `memory_access` | -73 | DM14/DM15/DM16 memory read, write, data transfer | `Dm14`, `Dm15`, `Dm16` |
 | `identification` | -71 | Software / ECU / component identification | `SoftwareIdentification`, `EcuIdentification`, `ComponentIdentification` |
 | `spn` | -71 | Bit extraction, scaling, and the status ranges | `Spn`, `SpnValue`, `RawValue`, `catalogue` |
@@ -825,7 +826,9 @@ expires. The outcome is correct; it just takes 750 ms to get there.
 
 ---
 
-## 9. Diagnostic fault lifecycle
+## 9. Diagnostics and periodic transmission
+
+### The fault lifecycle
 
 Diagnostics has two sides, and they need different things from the crate.
 
@@ -934,6 +937,55 @@ layers over it. The distinction the API preserves is between **no answer** and
 normal way of declining, while an explicit negative acknowledgement means the
 ECU heard and said no. Collapsing those two into one result would lose the only
 signal that tells you whether the ECU is even there.
+
+---
+
+### The other half: what an ECU sends unprompted
+
+Everything above is reactive — a frame arrives, the stack answers. But a J1939
+ECU spends most of its life *publishing*: engine speed every 20 ms, temperatures
+every second, whether or not anyone is listening. That traffic has no trigger to
+hang off, so it needs a timer of its own.
+
+`schedule::Schedule<N>` is that timer, and it deliberately holds only *when* to
+send:
+
+```mermaid
+flowchart LR
+    tick["tick(elapsed_ms)"] --> acc["accumulate per entry"]
+    acc --> due{"elapsed >= period?"}
+    due -- no --> wait["wait"]
+    due -- yes --> mark["mark due<br/>elapsed %= period"]
+    mark --> drain["next_due()"]
+    drain --> build["application builds<br/>the payload now"]
+    build --> send["Outgoing / Ecu::broadcast"]
+```
+
+The payload is built at `build`, not stored at registration. A periodic value
+that was cached would be a value that is always one cycle stale — the whole
+reason the message is periodic is that it changes.
+
+Two properties are worth stating because they are the ones that go wrong:
+
+- **A stalled loop sends one message, not a burst.** `elapsed %= period` rather
+  than `elapsed = 0`, and the due flag is a flag rather than a counter. If the
+  loop hangs for a second, a 20 ms broadcast sends one frame on recovery instead
+  of fifty stale copies — and because the remainder is kept, the phase survives,
+  so the average rate does not drift by the length of every hiccup.
+- **A suspension expires.** `suspend(timeout_ms)` is the receiving end of a DM13
+  stop-broadcast command, and it is a countdown rather than a flag. A tool that
+  says "stop" and is then unplugged must not silence an ECU until its next power
+  cycle, so the tool is expected to keep saying so.
+
+While suspended the entries do not accumulate at all. Letting them run and then
+releasing everything at once on resume would turn a request to quieten the bus
+into a burst on it — the opposite of what was asked for.
+
+`Ecu` adds the two things the core cannot: the payloads (a `BTreeMap`, since the
+core has no allocator) and the priority each group arbitrates at. Priority
+matters most here precisely because this is the continuous traffic: engine speed
+at priority 3 beats diagnostics at 6, which is why a real EEC1 is identifier
+`0x0CF00480`.
 
 ---
 

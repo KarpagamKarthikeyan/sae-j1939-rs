@@ -132,6 +132,50 @@ jobs:
             || { echo "FAIL: no TP.DT packets carrying the DM1"; exit 1; }
           echo "PASS: address claimed and a multi-packet DM1 was broadcast"
 
+      # A real ECU broadcasts without being asked. This checks the rate, the
+      # priority it arbitrates at, and that DM13 can actually quieten it.
+      - name: A virtual ECU broadcasts on a schedule and DM13 stops it
+        run: |
+          set -euo pipefail
+          candump -L vcan0 > /tmp/periodic.log &
+          CANDUMP=$!
+          ./target/debug/examples/vcan_ecu vcan0 > /tmp/periodic-ecu.log 2>&1 &
+          ECU=$!
+          sleep 3
+
+          # Count EEC1 broadcasts over a known window, then stop them with DM13
+          # and count again over the same window.
+          BEFORE=$(grep -ci "0CF00480" /tmp/periodic.log || true)
+          # DM13 stop: every network defaults to 'do not care' (0b11), so
+          # clearing the low two bits is 'stop' for the current data link.
+          cansend vcan0 18DFFFF9#FCFFFFFFFFFFFFFF
+          sleep 1
+          MARK=$(grep -ci "0CF00480" /tmp/periodic.log || true)
+          sleep 2
+          AFTER=$(grep -ci "0CF00480" /tmp/periodic.log || true)
+
+          kill $ECU $CANDUMP 2>/dev/null || true
+          sleep 1
+          echo "----- ECU output -----"; cat /tmp/periodic-ecu.log
+          echo "EEC1 frames: before=$BEFORE mark=$MARK after=$AFTER"
+
+          # EEC1 is scheduled at 50 ms, so ~2 seconds of running is tens of
+          # frames. One or two would mean it fired once and stopped.
+          [ "$BEFORE" -ge 20 ] \
+            || { echo "FAIL: only $BEFORE EEC1 broadcasts; the schedule is not running"; exit 1; }
+          # Priority 3, not the default 6: identifier 0x0CF00480, not 0x18F00480.
+          if grep -qi "18F00480" /tmp/periodic.log; then
+            echo "FAIL: EEC1 went out at the default priority"; exit 1
+          fi
+          # ...and after DM13 the bus goes quiet. A small tolerance, because
+          # candump's own buffering can flush a frame or two between the two
+          # reads; the point is that a 50 ms broadcast did not add ~40 frames.
+          [ "$((AFTER - MARK))" -le 3 ] \
+            || { echo "FAIL: DM13 did not stop the broadcasts ($MARK -> $AFTER)"; exit 1; }
+          grep -q "stopped by DM13" /tmp/periodic-ecu.log \
+            || { echo "FAIL: the ECU never noticed the DM13"; exit 1; }
+          echo "PASS: periodic broadcast at priority 3, stopped on command"
+
       # Both halves of the diagnostic exchange, as two separate processes on one
       # bus: an ECU that has faults, and the tool that reads and clears them.
       # Nothing here is mocked — the frames go through the kernel.

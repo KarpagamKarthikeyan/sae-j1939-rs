@@ -312,6 +312,7 @@ pub const fn classify(raw: u32, bit_length: u16) -> RawValue {
 /// parameter group.
 pub mod catalogue {
     use super::{bit_position, Spn};
+    use crate::pgn::{self, Pgn};
 
     /// SPN 190 — Engine Speed. Electronic Engine Controller 1 (`0x00F004`).
     pub const ENGINE_SPEED: Spn = Spn::new(
@@ -467,10 +468,112 @@ pub mod catalogue {
         WHEEL_BASED_VEHICLE_SPEED,
         BATTERY_POTENTIAL,
     ];
+
+    /// The catalogue grouped by the parameter group each definition lives in.
+    ///
+    /// An SPN is only meaningful inside its own PGN — the same bit offset means
+    /// something different in another message — so a decoder needs this
+    /// direction of the mapping, not just the flat list.
+    pub const GROUPS: [(Pgn, &[Spn]); 7] = [
+        (
+            pgn::EEC1,
+            &[
+                ENGINE_SPEED,
+                ACTUAL_ENGINE_PERCENT_TORQUE,
+                DRIVERS_DEMAND_ENGINE_PERCENT_TORQUE,
+            ],
+        ),
+        (
+            pgn::EEC2,
+            &[ACCELERATOR_PEDAL_POSITION, ENGINE_PERCENT_LOAD],
+        ),
+        (
+            pgn::ENGINE_TEMPERATURE_1,
+            &[
+                ENGINE_COOLANT_TEMPERATURE,
+                ENGINE_FUEL_TEMPERATURE,
+                ENGINE_OIL_TEMPERATURE,
+            ],
+        ),
+        (
+            pgn::ENGINE_FLUID_LEVEL_PRESSURE_1,
+            &[ENGINE_OIL_PRESSURE, ENGINE_OIL_LEVEL],
+        ),
+        (pgn::FUEL_ECONOMY, &[ENGINE_FUEL_RATE]),
+        (
+            pgn::CRUISE_CONTROL_VEHICLE_SPEED,
+            &[WHEEL_BASED_VEHICLE_SPEED],
+        ),
+        (pgn::VEHICLE_ELECTRICAL_POWER, &[BATTERY_POTENTIAL]),
+    ];
+
+    /// What this crate knows how to decode out of `pgn`, or an empty slice.
+    ///
+    /// ```
+    /// use sae_j1939_rs::spn::{catalogue, SpnValue};
+    /// use sae_j1939_rs::pgn;
+    ///
+    /// // An Electronic Engine Controller 1 frame off the bus.
+    /// let payload = [0xFF, 0x87, 0x96, 0xE0, 0x2E, 0xFF, 0xFF, 0xFF];
+    ///
+    /// let known = catalogue::for_pgn(pgn::EEC1);
+    /// assert_eq!(known.len(), 3);
+    /// assert_eq!(known[0].decode(&payload).unwrap(), SpnValue::Valid(1500.0));
+    ///
+    /// // Nothing known about a proprietary group.
+    /// assert!(catalogue::for_pgn(pgn::PROPRIETARY_A).is_empty());
+    /// ```
+    pub fn for_pgn(pgn: Pgn) -> &'static [Spn] {
+        let mut index = 0;
+        while index < GROUPS.len() {
+            if GROUPS[index].0.as_u32() == pgn.as_u32() {
+                return GROUPS[index].1;
+            }
+            index += 1;
+        }
+        &[]
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_catalogued_parameter_belongs_to_exactly_one_group() {
+        use super::catalogue;
+
+        // The flat list and the grouped one must describe the same catalogue:
+        // a parameter reachable only through `ALL` cannot be decoded by anyone
+        // who starts from a PGN, which is how frames actually arrive.
+        let mut grouped = std::vec::Vec::new();
+        for (_, spns) in catalogue::GROUPS {
+            grouped.extend(spns.iter().map(|spn| spn.number));
+        }
+        grouped.sort_unstable();
+
+        let mut flat: std::vec::Vec<u32> = catalogue::ALL.iter().map(|spn| spn.number).collect();
+        flat.sort_unstable();
+
+        assert_eq!(grouped, flat, "ALL and GROUPS disagree");
+        let mut unique = grouped.clone();
+        unique.dedup();
+        assert_eq!(unique, grouped, "an SPN appears in two groups");
+    }
+
+    #[test]
+    fn a_group_lookup_finds_what_the_table_holds() {
+        use super::catalogue;
+
+        for (group, spns) in catalogue::GROUPS {
+            let found = catalogue::for_pgn(group);
+            assert_eq!(found.len(), spns.len(), "{group}");
+            for (a, b) in found.iter().zip(spns) {
+                assert_eq!(a.number, b.number, "{group}");
+            }
+        }
+        // An unknown group is empty, not a panic and not a wrong answer.
+        assert!(catalogue::for_pgn(crate::pgn::DM1).is_empty());
+    }
+
     use super::catalogue::*;
     use super::*;
 

@@ -284,9 +284,71 @@ pub const ECU_IDENTIFICATION: Pgn = Pgn::new_masked(0x00FDC5);
 /// Component Identification (J1939-71).
 pub const COMPONENT_IDENTIFICATION: Pgn = Pgn::new_masked(0x00FEEB);
 
+// ---------------------------------------------------------------------------
+// Application-layer parameter groups (J1939-71).
+//
+// These are the ones this crate already decodes — every constant here is the
+// group behind an entry in `spn::catalogue`, so each is exercised by a test
+// that reads a real payload rather than merely asserting its own number back.
+// The full J1939-71 list runs to hundreds; it is sold rather than published,
+// and `host`'s DBC parser is the way to bring in the rest.
+// ---------------------------------------------------------------------------
+
+/// Electronic Engine Controller 1 (EEC1) — engine speed and torque.
+///
+/// Broadcast fast: engine speed is a control input, and 20 ms is the usual rate.
+pub const EEC1: Pgn = Pgn::new_masked(0x00F004);
+
+/// Electronic Engine Controller 2 (EEC2) — pedal position and engine load.
+pub const EEC2: Pgn = Pgn::new_masked(0x00F003);
+
+/// Engine Temperature 1 (ET1) — coolant, fuel, and oil temperatures.
+pub const ENGINE_TEMPERATURE_1: Pgn = Pgn::new_masked(0x00FEEE);
+
+/// Engine Fluid Level/Pressure 1 (EFL/P1) — oil pressure and level.
+pub const ENGINE_FLUID_LEVEL_PRESSURE_1: Pgn = Pgn::new_masked(0x00FEEF);
+
+/// Fuel Economy, liquid (LFE) — fuel rate and economy.
+pub const FUEL_ECONOMY: Pgn = Pgn::new_masked(0x00FEF2);
+
+/// Cruise Control/Vehicle Speed 1 (CCVS1) — wheel-based vehicle speed.
+pub const CRUISE_CONTROL_VEHICLE_SPEED: Pgn = Pgn::new_masked(0x00FEF1);
+
+/// Vehicle Electrical Power 1 (VEP1) — battery potential.
+pub const VEHICLE_ELECTRICAL_POWER: Pgn = Pgn::new_masked(0x00FEF7);
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_application_groups_are_broadcast_and_distinct() {
+        let groups = [
+            ("EEC1", EEC1, 0x00F004),
+            ("EEC2", EEC2, 0x00F003),
+            ("ET1", ENGINE_TEMPERATURE_1, 0x00FEEE),
+            ("EFL/P1", ENGINE_FLUID_LEVEL_PRESSURE_1, 0x00FEEF),
+            ("LFE", FUEL_ECONOMY, 0x00FEF2),
+            ("CCVS1", CRUISE_CONTROL_VEHICLE_SPEED, 0x00FEF1),
+            ("VEP1", VEHICLE_ELECTRICAL_POWER, 0x00FEF7),
+        ];
+
+        for (name, pgn, raw) in groups {
+            assert_eq!(pgn.as_u32(), raw, "{name}");
+            // Every one is PDU2, which is what makes them broadcast parameter
+            // groups rather than something addressed to a single ECU. A typo
+            // landing in the PDU1 range would silently normalise its low byte
+            // away and quietly become a different group.
+            assert!(pgn.is_pdu2(), "{name} must be a broadcast group");
+            assert!(pgn.group_extension().is_some(), "{name}");
+        }
+
+        for (i, (name, pgn, _)) in groups.iter().enumerate() {
+            for (other_name, other, _) in &groups[..i] {
+                assert_ne!(pgn, other, "{name} collides with {other_name}");
+            }
+        }
+    }
 
     #[test]
     fn pdu1_normalises_away_the_destination_byte() {

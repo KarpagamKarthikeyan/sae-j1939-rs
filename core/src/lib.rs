@@ -85,6 +85,7 @@
 //! | [`address_claim`] | J1939-81 | Claiming, defending, and relocating an address |
 //! | [`diagnostics`] | J1939-73 | DM1/DM2 trouble codes and lamp status |
 //! | [`fault_log`] | J1939-73 | The fault state an ECU reports about itself |
+//! | [`schedule`] | — | Periodic transmission, and DM13 broadcast control |
 //! | [`memory_access`] | J1939-73 | DM14/DM15/DM16 memory read, write, and data transfer |
 //! | [`identification`] | J1939-71 | Software, ECU, and component identification |
 //! | [`spn`] | J1939-71 | Suspect Parameter Numbers: payload bytes to engineering units |
@@ -131,6 +132,7 @@ pub mod node;
 pub mod pgn;
 pub mod proprietary;
 pub mod request;
+pub mod schedule;
 pub mod spn;
 pub mod tp;
 pub mod types;

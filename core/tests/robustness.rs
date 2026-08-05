@@ -31,6 +31,7 @@ use sae_j1939_rs::memory_access::{Dm14, Dm15, Dm16};
 use sae_j1939_rs::node::Node;
 use sae_j1939_rs::proprietary::ProprietaryB;
 use sae_j1939_rs::request::{Acknowledgement, Request};
+use sae_j1939_rs::schedule::Schedule;
 use sae_j1939_rs::spn::Spn;
 use sae_j1939_rs::tp::{Reassembler, TpCm, TpDt};
 use sae_j1939_rs::{Address, Frame, Id, Name, Pgn};
@@ -389,4 +390,104 @@ fn the_fault_log_survives_any_sequence_of_operations() {
             context()
         );
     }
+}
+
+/// The transmission schedule, driven by an arbitrary sequence of operations.
+///
+/// The invariants that matter are the ones a wrong sequence would break
+/// quietly: more entries than slots, the same group registered twice, or a
+/// suspension that never ends — which on a real bus is an ECU that has gone
+/// silent and will not come back.
+#[test]
+fn the_schedule_survives_any_sequence_of_operations() {
+    const CAPACITY: usize = 8;
+    let mut rng = Rng::new(0x5C_1939_0001);
+    let mut schedule = Schedule::<CAPACITY>::new();
+
+    for round in 0..ROUNDS {
+        let seed = rng.0;
+        // A small pool, so registration collisions and removals actually happen.
+        let group = Pgn::new_masked(0x00F000 + (rng.u8() % 12) as u32);
+        let destination = Address::new(if rng.u8() % 2 == 0 {
+            0xFF
+        } else {
+            rng.u8() % 4
+        });
+
+        match rng.u8() % 8 {
+            0..=2 => {
+                let _ = schedule.send_every(group, destination, rng.u8() as u16);
+            }
+            3 => {
+                let _ = schedule.remove(group, destination);
+            }
+            4..=5 => {
+                schedule.tick(rng.u8() as u16 * 4);
+                // Drain a random amount, so leftovers are exercised too.
+                for _ in 0..rng.u8() % 4 {
+                    let _ = schedule.next_due();
+                }
+            }
+            6 => schedule.suspend(rng.u8() as u16 * 8),
+            _ => match rng.u8() % 2 {
+                0 => schedule.resume(),
+                _ => schedule.clear(),
+            },
+        }
+
+        let context = || format!("round {round}, seed {seed:#018x}");
+
+        assert!(
+            schedule.len() <= CAPACITY,
+            "the schedule outgrew its capacity: {}",
+            context()
+        );
+        assert!(
+            schedule.pending() <= schedule.len(),
+            "more messages due than are registered: {}",
+            context()
+        );
+
+        // A group may appear once per destination, never twice for the same
+        // one — a duplicate would double that message's rate on the bus.
+        let registered: std::vec::Vec<(u32, u8)> = schedule
+            .entries()
+            .map(|(due, _)| (due.pgn.as_u32(), due.destination.as_u8()))
+            .collect();
+        for (index, entry) in registered.iter().enumerate() {
+            assert!(
+                !registered[..index].contains(entry),
+                "duplicate schedule entry: {}",
+                context()
+            );
+        }
+
+        // A suspension must always be running down toward zero.
+        if let Some(remaining) = schedule.resumes_in_ms() {
+            assert!(
+                remaining > 0,
+                "suspended with nothing left to run: {}",
+                context()
+            );
+            assert!(schedule.is_suspended(), "{}", context());
+        } else {
+            assert!(!schedule.is_suspended(), "{}", context());
+        }
+    }
+
+    // Whatever state the fuzz left it in, enough quiet time must bring it back:
+    // an ECU that could be silenced permanently is a worse failure than any
+    // decoding bug.
+    schedule.clear();
+    schedule
+        .broadcast_every(Pgn::new_masked(0x00F004), 100)
+        .unwrap();
+    for _ in 0..100 {
+        schedule.tick(1000);
+    }
+    assert!(
+        !schedule.is_suspended(),
+        "a suspension outlived every timeout"
+    );
+    assert!(schedule.pending() > 0, "transmission never resumed");
 }

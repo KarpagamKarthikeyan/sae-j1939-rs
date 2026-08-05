@@ -61,13 +61,16 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use sae_j1939_rs::address_claim::ClaimState;
-use sae_j1939_rs::diagnostics::{self, Dm5, Dtc, Lamp, Lamps, ObdCompliance};
+use sae_j1939_rs::diagnostics::{
+    self, BroadcastCommand, Dm13, Dm5, Dtc, Lamp, Lamps, Network, ObdCompliance,
+};
 use sae_j1939_rs::etp::{self, EtpCm, EtpDt};
 use sae_j1939_rs::fault_log::FaultLog;
 use sae_j1939_rs::frame::Frame;
 use sae_j1939_rs::identification::SoftwareIdentification;
 use sae_j1939_rs::node::{Event, Node, Outgoing, Progress};
 use sae_j1939_rs::request::{Acknowledgement, Request};
+use sae_j1939_rs::schedule::{Schedule, DEFAULT_SUSPEND_MS};
 use sae_j1939_rs::tp::T3_TIMEOUT_MS;
 use sae_j1939_rs::{pgn, Address, Id, Name, Pgn, Priority};
 
@@ -106,6 +109,13 @@ pub const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(2);
 /// drive [`FaultLog`] itself and transmit with [`Ecu::broadcast`].
 pub const FAULT_CAPACITY: usize = 32;
 
+/// How many periodic messages an [`Ecu`] will transmit on a schedule.
+///
+/// Generous: a busy engine controller broadcasts a dozen or so parameter
+/// groups. Fixed rather than a generic parameter, for the same reason as
+/// [`FAULT_CAPACITY`].
+pub const SCHEDULE_CAPACITY: usize = 16;
+
 /// A J1939 ECU bound to a bus.
 ///
 /// `BUF` is the largest message it will accept and `SESSIONS` how many peers
@@ -131,6 +141,13 @@ pub struct Ecu<B: Bus, const BUF: usize = 1785, const SESSIONS: usize = 8> {
     inventory: BTreeMap<u8, Name>,
     /// What this ECU claims about emissions compliance in DM5.
     obd_compliance: ObdCompliance,
+    /// What this ECU transmits on its own, and how often.
+    schedule: Schedule<SCHEDULE_CAPACITY>,
+    /// The payload for each scheduled message. Held here rather than in
+    /// `Schedule` because the core has no allocator, and because a periodic
+    /// message's payload is replaced every cycle — a copy inside the timer
+    /// would be a copy that is always one cycle stale.
+    payloads: BTreeMap<(u32, u8), (Vec<u8>, Priority)>,
     last_tick: Instant,
 }
 
@@ -196,6 +213,8 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
             faults: FaultLog::new(),
             inventory: BTreeMap::new(),
             obd_compliance: ObdCompliance::NotIntended,
+            schedule: Schedule::new(),
+            payloads: BTreeMap::new(),
             last_tick: Instant::now(),
         }
     }
@@ -310,9 +329,25 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
     /// claimed, so transmitting first would put a conflicting source address on
     /// the bus. Call [`Ecu::claim_address`] and check [`Ecu::has_address`].
     pub fn broadcast(&mut self, group: Pgn, data: &[u8]) -> io::Result<()> {
+        self.broadcast_with_priority(group, data, Priority::DEFAULT)
+    }
+
+    /// Broadcast `data` as `group` at a chosen priority.
+    ///
+    /// [`Ecu::broadcast`] uses [`Priority::DEFAULT`] (6), which is right for
+    /// most traffic. Continuous engine and vehicle data conventionally runs
+    /// higher — a lower number wins arbitration — so that a burst of
+    /// diagnostics cannot delay a control input.
+    pub fn broadcast_with_priority(
+        &mut self,
+        group: Pgn,
+        data: &[u8],
+        priority: Priority,
+    ) -> io::Result<()> {
         self.check_may_transmit()?;
-        let mut outgoing =
-            Outgoing::new(group, self.address(), Address::GLOBAL, data).map_err(invalid_input)?;
+        let mut outgoing = Outgoing::new(group, self.address(), Address::GLOBAL, data)
+            .map_err(invalid_input)?
+            .with_priority(priority);
         let paced = outgoing.needs_pacing();
 
         let mut first = true;
@@ -395,6 +430,243 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
                         self.pending.push_back(message);
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Transmitting on a schedule — what an ECU mostly does.
+    // ---------------------------------------------------------------------
+
+    /// Broadcast `data` as `group` every `period`, from now on.
+    ///
+    /// This is what a real ECU spends its life doing: engine speed at 20 ms,
+    /// temperatures at a second, whether or not anyone asked. [`Ecu::poll`]
+    /// sends them, so the application loop stays a loop over `poll`.
+    ///
+    /// Call it again with fresh bytes to update the value — see
+    /// [`Ecu::update_periodic`], which does that without disturbing the timing.
+    /// Registering the same group twice changes its rate rather than adding a
+    /// second entry.
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidInput`] for a period of zero or longer than
+    /// [`u16::MAX`] milliseconds (about 65 seconds), or when the schedule is
+    /// full — see [`SCHEDULE_CAPACITY`].
+    ///
+    /// Nothing is transmitted until an address is claimed, and a period shorter
+    /// than the loop's own cycle time cannot be honoured; the schedule delays
+    /// rather than bursting to catch up.
+    ///
+    /// # Keep it to eight bytes
+    ///
+    /// Periodic parameter groups are single-frame by design. A longer payload
+    /// still works, but it goes out over the transport protocol — a broadcast
+    /// one is paced 50 ms per packet, so [`Ecu::poll`] blocks for that long
+    /// every period, and a period near the transfer time would leave the bus
+    /// carrying nothing else.
+    ///
+    /// ```
+    /// # use std::cell::RefCell;
+    /// # use std::collections::VecDeque;
+    /// # use std::io;
+    /// # use std::time::Duration;
+    /// # use sae_j1939_host::bus::Bus;
+    /// # use sae_j1939_host::ecu::Ecu;
+    /// # use sae_j1939_host::sae_j1939_rs::{pgn, Address, Frame, Name};
+    /// # #[derive(Default)]
+    /// # struct FakeBus { sent: RefCell<Vec<Frame>> }
+    /// # impl Bus for FakeBus {
+    /// #     fn send_frame(&self, f: &Frame) -> io::Result<()> { self.sent.borrow_mut().push(*f); Ok(()) }
+    /// #     fn recv_frame(&self) -> io::Result<Option<Frame>> { Ok(None) }
+    /// # }
+    /// # let name = Name::new().with_manufacturer_code(300).with_identity_number(1);
+    /// # let mut ecu = Ecu::<_, 1785, 4>::new(FakeBus::default(), name, Address::new(0x80));
+    /// # ecu.claim_address()?;
+    /// // Engine speed 1500 rpm, broadcast twenty times a second.
+    /// let eec1 = [0xFF, 0x87, 0x96, 0xE0, 0x2E, 0xFF, 0xFF, 0xFF];
+    /// ecu.broadcast_every(pgn::EEC1, &eec1, Duration::from_millis(50))?;
+    ///
+    /// // Each time round the control loop, publish the new value.
+    /// ecu.update_periodic(pgn::EEC1, &eec1)?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn broadcast_every(&mut self, group: Pgn, data: &[u8], period: Duration) -> io::Result<()> {
+        self.send_every(group, Address::GLOBAL, data, period)
+    }
+
+    /// Send `data` to one ECU as `group` every `period`. See
+    /// [`Ecu::broadcast_every`].
+    pub fn send_every(
+        &mut self,
+        group: Pgn,
+        destination: Address,
+        data: &[u8],
+        period: Duration,
+    ) -> io::Result<()> {
+        let period_ms = u16::try_from(period.as_millis()).map_err(|_| {
+            invalid_input(format!(
+                "a period of {:?} is longer than the {} ms a schedule holds",
+                period,
+                u16::MAX
+            ))
+        })?;
+        self.schedule
+            .send_every(group, destination, period_ms)
+            .map_err(invalid_input)?;
+        // Keep the priority if this group was already scheduled: changing the
+        // rate should not silently reset how it arbitrates.
+        let priority = self
+            .payloads
+            .get(&key(group, destination))
+            .map_or(Priority::DEFAULT, |(_, priority)| *priority);
+        self.payloads
+            .insert(key(group, destination), (data.to_vec(), priority));
+        Ok(())
+    }
+
+    /// Send a scheduled message at a chosen priority from now on.
+    ///
+    /// Scheduled messages default to [`Priority::DEFAULT`] (6). Continuous
+    /// engine and vehicle data conventionally runs higher — engine speed is a
+    /// control input, and a lower number wins arbitration.
+    ///
+    /// Returns [`io::ErrorKind::NotFound`] if the group is not scheduled.
+    pub fn set_periodic_priority(
+        &mut self,
+        group: Pgn,
+        destination: Address,
+        priority: Priority,
+    ) -> io::Result<()> {
+        match self.payloads.get_mut(&key(group, destination)) {
+            Some((_, stored)) => {
+                *stored = priority;
+                Ok(())
+            }
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{group} is not scheduled for transmission"),
+            )),
+        }
+    }
+
+    /// Replace the payload of an already-scheduled message, leaving its timing
+    /// alone.
+    ///
+    /// The normal way to publish a new sensor reading: the value changes every
+    /// cycle, the rate does not.
+    ///
+    /// Returns [`io::ErrorKind::NotFound`] if the group is not scheduled —
+    /// silently doing nothing would leave stale values going out and look like
+    /// a sensor that had stopped changing.
+    pub fn update_periodic(&mut self, group: Pgn, data: &[u8]) -> io::Result<()> {
+        self.update_periodic_to(group, Address::GLOBAL, data)
+    }
+
+    /// Replace the payload of a destination-specific periodic message. See
+    /// [`Ecu::update_periodic`].
+    pub fn update_periodic_to(
+        &mut self,
+        group: Pgn,
+        destination: Address,
+        data: &[u8],
+    ) -> io::Result<()> {
+        if !self.schedule.contains(group, destination) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{group} is not scheduled for transmission"),
+            ));
+        }
+        let priority = self
+            .payloads
+            .get(&key(group, destination))
+            .map_or(Priority::DEFAULT, |(_, priority)| *priority);
+        self.payloads
+            .insert(key(group, destination), (data.to_vec(), priority));
+        Ok(())
+    }
+
+    /// Stop transmitting `group` periodically, returning whether it was
+    /// scheduled.
+    pub fn stop_periodic(&mut self, group: Pgn, destination: Address) -> bool {
+        self.payloads.remove(&key(group, destination));
+        self.schedule.remove(group, destination)
+    }
+
+    /// What this ECU transmits on a schedule, as `(group, destination, period)`.
+    pub fn periodic(&self) -> impl Iterator<Item = (Pgn, Address, Duration)> + '_ {
+        self.schedule.entries().map(|(due, period_ms)| {
+            (
+                due.pgn,
+                due.destination,
+                Duration::from_millis(period_ms as u64),
+            )
+        })
+    }
+
+    /// Whether periodic transmission is currently stopped by a DM13 command.
+    pub fn broadcasts_suspended(&self) -> bool {
+        self.schedule.is_suspended()
+    }
+
+    /// Stop periodic transmission for `timeout`, then resume automatically.
+    ///
+    /// Applied for you when a DM13 stop-broadcast command arrives; exposed
+    /// because an application may have its own reason to go quiet.
+    pub fn suspend_broadcasts(&mut self, timeout: Duration) {
+        let ms = u16::try_from(timeout.as_millis()).unwrap_or(u16::MAX);
+        self.schedule.suspend(ms);
+    }
+
+    /// Resume periodic transmission now.
+    pub fn resume_broadcasts(&mut self) {
+        self.schedule.resume();
+    }
+
+    /// Act on a DM13 stop/start broadcast command.
+    ///
+    /// Only the commands aimed at a network this ECU is on are obeyed:
+    /// "current data link" always, and the vehicle bus, since that is what a
+    /// SocketCAN interface is. A command naming only the implement bus is left
+    /// alone rather than guessed at — silencing an ECU because a message meant
+    /// for a different network mentioned it would be worse than ignoring it.
+    ///
+    /// Diagnostic messages are **not** suspended. DM13 exists so that a tool
+    /// can free up bandwidth for diagnostic work; stopping the diagnostics it
+    /// came for would defeat the purpose.
+    fn on_dm13(&mut self, command: &Dm13) {
+        for network in [Network::CurrentDataLink, Network::Vehicle] {
+            match command.command(network) {
+                BroadcastCommand::Stop => {
+                    self.schedule.suspend(DEFAULT_SUSPEND_MS);
+                    return;
+                }
+                BroadcastCommand::Start => {
+                    self.schedule.resume();
+                    return;
+                }
+                BroadcastCommand::Reserved | BroadcastCommand::DoNotCare => {}
+            }
+        }
+    }
+
+    /// Send everything the schedule says is due.
+    fn send_due(&mut self) -> io::Result<()> {
+        while let Some(due) = self.schedule.next_due() {
+            let Some((payload, priority)) = self.payloads.get(&key(due.pgn, due.destination))
+            else {
+                continue;
+            };
+            // Clone so the send does not hold a borrow of `self.payloads`.
+            // Periodic messages are single-frame in practice, so this is eight
+            // bytes; correctness over saving a copy that small.
+            let (payload, priority) = (payload.clone(), *priority);
+            if due.destination.is_broadcast() {
+                self.broadcast_with_priority(due.pgn, &payload, priority)?;
+            } else {
+                self.send_to(due.destination, due.pgn, &payload)?;
             }
         }
         Ok(())
@@ -930,6 +1202,19 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
         // application question — but the diagnostic groups are ones this type
         // owns the state for, so it answers them itself. The request is still
         // returned to the caller, which may want to log it.
+        // A tool asking the bus to go quiet so it can work. Acted on whether
+        // or not this ECU has an address: an ECU still claiming has nothing to
+        // suspend, but the command is not addressed to anyone in particular
+        // and refusing it would be surprising.
+        if let Some(message) = &message {
+            if message.pgn == pgn::DM13 && message.data.len() >= 8 {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&message.data[..8]);
+                let command = Dm13::decode(&bytes);
+                self.on_dm13(&command);
+            }
+        }
+
         if let Some(message) = &message {
             if message.pgn == pgn::REQUEST && self.node.has_address() {
                 if let Ok(request) = Request::decode(&message.data) {
@@ -978,6 +1263,14 @@ impl<B: Bus, const BUF: usize, const SESSIONS: usize> Ecu<B, BUF, SESSIONS> {
         // away rather than delay it.
         if self.node.has_address() && self.faults.tick(elapsed_ms) {
             self.send_dm1()?;
+        }
+
+        // Everything this ECU publishes on its own. Held back until an address
+        // is claimed for the same reason as the DM1: J1939-81 does not allow
+        // transmitting from an address that has not been claimed.
+        if self.node.has_address() {
+            self.schedule.tick(elapsed_ms);
+            self.send_due()?;
         }
         Ok(())
     }
@@ -1040,6 +1333,12 @@ fn saturating_count(count: usize) -> u8 {
     u8::try_from(count).unwrap_or(u8::MAX)
 }
 
+/// A scheduled message is identified by its group *and* its destination: the
+/// same parameter group may legitimately go to two places at two rates.
+fn key(group: Pgn, destination: Address) -> (u32, u8) {
+    (group.as_u32(), destination.as_u8())
+}
+
 fn invalid_input<E: ToString>(error: E) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
 }
@@ -1053,6 +1352,7 @@ mod tests {
     use sae_j1939_rs::address_claim::ClaimState;
     use sae_j1939_rs::diagnostics::{self, Dtc, Lamp, LampStatus, Lamps};
     use sae_j1939_rs::identification::{self, EcuIdentification};
+    use sae_j1939_rs::spn::{catalogue, SpnValue};
     use sae_j1939_rs::tp::{AbortReason, TpCm, TpDt, Transmitter};
     use sae_j1939_rs::Name;
 
@@ -2177,6 +2477,365 @@ mod tests {
         // Not ours to answer, and specifically not answered with a wrong guess.
         assert!(ecu.bus().sent_with_pgn(pgn::DM1).is_empty());
         assert!(ecu.bus().sent_with_pgn(pgn::ACKNOWLEDGEMENT).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Transmitting on a schedule.
+    // -----------------------------------------------------------------------
+
+    /// A plausible EEC1 payload: 1500 rpm.
+    const EEC1: [u8; 8] = [0xFF, 0x87, 0x96, 0xE0, 0x2E, 0xFF, 0xFF, 0xFF];
+
+    #[test]
+    fn an_ecu_with_nothing_scheduled_stays_quiet() {
+        let mut ecu = claimed_ecu();
+        run_for(&mut ecu, Duration::from_millis(300));
+        assert!(ecu.bus().sent_with_pgn(pgn::EEC1).is_empty());
+        assert_eq!(ecu.periodic().count(), 0);
+    }
+
+    #[test]
+    fn a_scheduled_message_goes_out_at_its_own_rate() {
+        let mut ecu = claimed_ecu();
+        ecu.broadcast_every(pgn::EEC1, &EEC1, Duration::from_millis(100))
+            .unwrap();
+
+        run_for(&mut ecu, Duration::from_millis(520));
+        let sent = ecu.bus().sent_with_pgn(pgn::EEC1).len();
+        // Five in half a second, allowing one either side for scheduling jitter
+        // on a loaded test machine.
+        assert!(
+            (4..=6).contains(&sent),
+            "expected about five EEC1 broadcasts, got {sent}"
+        );
+        assert_eq!(sent, ecu.bus().sent_with_pgn(pgn::EEC1).len());
+    }
+
+    #[test]
+    fn the_scheduled_payload_is_the_one_that_goes_on_the_bus() {
+        let mut ecu = claimed_ecu();
+        ecu.broadcast_every(pgn::EEC1, &EEC1, Duration::from_millis(20))
+            .unwrap();
+        run_for(&mut ecu, Duration::from_millis(60));
+
+        let frames = ecu.bus().sent_with_pgn(pgn::EEC1);
+        assert!(!frames.is_empty());
+        assert_eq!(frames[0].payload(), &EEC1);
+        // And it decodes to what it claims to be.
+        assert_eq!(
+            catalogue::ENGINE_SPEED.decode(frames[0].data()).unwrap(),
+            SpnValue::Valid(1500.0)
+        );
+    }
+
+    #[test]
+    fn updating_the_payload_does_not_disturb_the_timing() {
+        let mut ecu = claimed_ecu();
+        ecu.broadcast_every(pgn::EEC1, &EEC1, Duration::from_millis(50))
+            .unwrap();
+
+        // Publish a new value on every pass, the way a control loop would.
+        let mut faster = EEC1;
+        faster[4] = 0x5D; // a different engine speed
+        let deadline = Instant::now() + Duration::from_millis(220);
+        while Instant::now() < deadline {
+            ecu.update_periodic(pgn::EEC1, &faster).unwrap();
+            ecu.poll().unwrap();
+        }
+
+        let frames = ecu.bus().sent_with_pgn(pgn::EEC1);
+        assert!(
+            frames.len() >= 3,
+            "updating must not stop transmission; got {}",
+            frames.len()
+        );
+        assert_eq!(
+            frames.last().unwrap().payload(),
+            &faster,
+            "the newest value must be the one sent"
+        );
+    }
+
+    #[test]
+    fn updating_something_that_is_not_scheduled_is_an_error() {
+        // Silently doing nothing would leave a stale value going out, which
+        // looks exactly like a sensor that stopped changing.
+        let mut ecu = claimed_ecu();
+        let error = ecu
+            .update_periodic(pgn::EEC1, &EEC1)
+            .expect_err("nothing is scheduled");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn several_groups_keep_their_separate_rates() {
+        let mut ecu = claimed_ecu();
+        ecu.broadcast_every(pgn::EEC1, &EEC1, Duration::from_millis(50))
+            .unwrap();
+        ecu.broadcast_every(
+            pgn::ENGINE_TEMPERATURE_1,
+            &[0x50; 8],
+            Duration::from_millis(500),
+        )
+        .unwrap();
+
+        run_for(&mut ecu, Duration::from_millis(520));
+        let fast = ecu.bus().sent_with_pgn(pgn::EEC1).len();
+        let slow = ecu.bus().sent_with_pgn(pgn::ENGINE_TEMPERATURE_1).len();
+        assert!(fast >= 8, "the fast group should be ~10, got {fast}");
+        assert!(
+            slow <= 2,
+            "the slow group should be ~1, got {slow} — rates are not independent"
+        );
+    }
+
+    #[test]
+    fn an_ecu_without_an_address_transmits_nothing_periodic() {
+        let mut ecu = ecu_on(FakeBus::default(), name_for(1, 100));
+        ecu.broadcast_every(pgn::EEC1, &EEC1, Duration::from_millis(20))
+            .unwrap();
+        run_for(&mut ecu, Duration::from_millis(200));
+        assert!(ecu.bus().sent_with_pgn(pgn::EEC1).is_empty());
+
+        // ...and starts once it is on the bus.
+        ecu.claim_address().unwrap();
+        run_for(&mut ecu, Duration::from_millis(100));
+        assert!(!ecu.bus().sent_with_pgn(pgn::EEC1).is_empty());
+    }
+
+    #[test]
+    fn stopping_a_periodic_message_stops_it() {
+        let mut ecu = claimed_ecu();
+        ecu.broadcast_every(pgn::EEC1, &EEC1, Duration::from_millis(20))
+            .unwrap();
+        run_for(&mut ecu, Duration::from_millis(100));
+        let before = ecu.bus().sent_with_pgn(pgn::EEC1).len();
+        assert!(before > 0);
+
+        assert!(ecu.stop_periodic(pgn::EEC1, Address::GLOBAL));
+        assert!(
+            !ecu.stop_periodic(pgn::EEC1, Address::GLOBAL),
+            "already gone"
+        );
+        run_for(&mut ecu, Duration::from_millis(200));
+        assert_eq!(ecu.bus().sent_with_pgn(pgn::EEC1).len(), before);
+    }
+
+    #[test]
+    fn the_schedule_reads_back() {
+        let mut ecu = claimed_ecu();
+        ecu.broadcast_every(pgn::EEC1, &EEC1, Duration::from_millis(50))
+            .unwrap();
+        ecu.send_every(
+            pgn::EEC2,
+            Address::new(0x21),
+            &[0u8; 8],
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        let listed: Vec<_> = ecu.periodic().collect();
+        assert_eq!(
+            listed,
+            [
+                (pgn::EEC1, Address::GLOBAL, Duration::from_millis(50)),
+                (pgn::EEC2, Address::new(0x21), Duration::from_millis(100)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_period_of_zero_is_refused() {
+        let mut ecu = claimed_ecu();
+        let error = ecu
+            .broadcast_every(pgn::EEC1, &EEC1, Duration::ZERO)
+            .expect_err("every zero milliseconds means nothing");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(ecu.periodic().count(), 0);
+    }
+
+    #[test]
+    fn a_period_too_long_for_the_schedule_is_refused_rather_than_truncated() {
+        // Silently wrapping a two-minute period into something under a second
+        // would flood the bus with the opposite of what was asked for.
+        let mut ecu = claimed_ecu();
+        let error = ecu
+            .broadcast_every(pgn::EEC1, &EEC1, Duration::from_secs(120))
+            .expect_err("longer than u16 milliseconds");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(ecu.periodic().count(), 0);
+    }
+
+    #[test]
+    fn a_scheduled_message_goes_out_at_the_priority_it_was_given() {
+        let mut ecu = claimed_ecu();
+        ecu.broadcast_every(pgn::EEC1, &EEC1, Duration::from_millis(20))
+            .unwrap();
+        run_for(&mut ecu, Duration::from_millis(60));
+        assert_eq!(
+            ecu.bus().sent_with_pgn(pgn::EEC1)[0].id().priority(),
+            Priority::DEFAULT,
+            "the default until told otherwise"
+        );
+
+        // Engine speed is a control input: it should win arbitration against
+        // diagnostics, which means a lower priority number.
+        let engine = Priority::new(3).unwrap();
+        ecu.set_periodic_priority(pgn::EEC1, Address::GLOBAL, engine)
+            .unwrap();
+        let before = ecu.bus().sent_with_pgn(pgn::EEC1).len();
+        run_for(&mut ecu, Duration::from_millis(60));
+
+        let frames = ecu.bus().sent_with_pgn(pgn::EEC1);
+        assert!(frames.len() > before);
+        assert_eq!(frames.last().unwrap().id().priority(), engine);
+        // ...and the identifier really is the one a receiver would see.
+        assert_eq!(frames.last().unwrap().id().as_u32(), 0x0CF00480);
+    }
+
+    #[test]
+    fn changing_the_rate_does_not_reset_the_priority() {
+        let mut ecu = claimed_ecu();
+        let engine = Priority::new(3).unwrap();
+        ecu.broadcast_every(pgn::EEC1, &EEC1, Duration::from_millis(20))
+            .unwrap();
+        ecu.set_periodic_priority(pgn::EEC1, Address::GLOBAL, engine)
+            .unwrap();
+
+        // Re-register at a different rate, and update the value.
+        ecu.broadcast_every(pgn::EEC1, &EEC1, Duration::from_millis(40))
+            .unwrap();
+        ecu.update_periodic(pgn::EEC1, &EEC1).unwrap();
+
+        run_for(&mut ecu, Duration::from_millis(100));
+        let frames = ecu.bus().sent_with_pgn(pgn::EEC1);
+        assert!(!frames.is_empty());
+        assert!(frames.iter().all(|f| f.id().priority() == engine));
+    }
+
+    #[test]
+    fn setting_the_priority_of_something_unscheduled_is_an_error() {
+        let mut ecu = claimed_ecu();
+        let error = ecu
+            .set_periodic_priority(pgn::EEC1, Address::GLOBAL, Priority::new(3).unwrap())
+            .expect_err("nothing is scheduled");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_one_shot_broadcast_can_choose_its_priority_too() {
+        let mut ecu = claimed_ecu();
+        let engine = Priority::new(3).unwrap();
+        ecu.broadcast_with_priority(pgn::EEC1, &EEC1, engine)
+            .unwrap();
+
+        let frames = ecu.bus().sent_with_pgn(pgn::EEC1);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].id().priority(), engine);
+    }
+
+    /// A DM13 command frame from a tool at 0xF9.
+    fn dm13_frame(command: BroadcastCommand) -> Frame {
+        let dm13 = Dm13::new().with_command(Network::CurrentDataLink, command);
+        Frame::from_payload(
+            Id::broadcast(Priority::DEFAULT, pgn::DM13, Address::new(0xF9)),
+            dm13.encode(),
+        )
+    }
+
+    #[test]
+    fn dm13_stops_periodic_transmission_and_dm13_starts_it_again() {
+        let mut ecu = claimed_ecu();
+        ecu.broadcast_every(pgn::EEC1, &EEC1, Duration::from_millis(20))
+            .unwrap();
+        run_for(&mut ecu, Duration::from_millis(100));
+        assert!(!ecu.bus().sent_with_pgn(pgn::EEC1).is_empty());
+
+        ecu.bus().queue(dm13_frame(BroadcastCommand::Stop));
+        ecu.poll().unwrap();
+        assert!(ecu.broadcasts_suspended());
+
+        let quiet_from = ecu.bus().sent_with_pgn(pgn::EEC1).len();
+        run_for(&mut ecu, Duration::from_millis(300));
+        assert_eq!(
+            ecu.bus().sent_with_pgn(pgn::EEC1).len(),
+            quiet_from,
+            "the bus must actually go quiet"
+        );
+
+        ecu.bus().queue(dm13_frame(BroadcastCommand::Start));
+        ecu.poll().unwrap();
+        assert!(!ecu.broadcasts_suspended());
+        run_for(&mut ecu, Duration::from_millis(100));
+        assert!(ecu.bus().sent_with_pgn(pgn::EEC1).len() > quiet_from);
+    }
+
+    #[test]
+    fn a_dm13_that_names_no_network_this_ecu_is_on_is_left_alone() {
+        let mut ecu = claimed_ecu();
+        ecu.broadcast_every(pgn::EEC1, &EEC1, Duration::from_millis(20))
+            .unwrap();
+
+        // A command aimed only at the implement bus. Silencing the vehicle bus
+        // because another network was mentioned would be worse than ignoring it.
+        let dm13 = Dm13::new().with_command(Network::Implement, BroadcastCommand::Stop);
+        ecu.bus().queue(Frame::from_payload(
+            Id::broadcast(Priority::DEFAULT, pgn::DM13, Address::new(0xF9)),
+            dm13.encode(),
+        ));
+        ecu.poll().unwrap();
+
+        assert!(!ecu.broadcasts_suspended());
+        run_for(&mut ecu, Duration::from_millis(100));
+        assert!(!ecu.bus().sent_with_pgn(pgn::EEC1).is_empty());
+    }
+
+    #[test]
+    fn diagnostics_keep_flowing_while_broadcasts_are_stopped() {
+        // DM13 exists so a tool can free up bandwidth for diagnostic work.
+        // Suspending the diagnostics it came for would defeat the purpose.
+        let mut ecu = claimed_ecu();
+        ecu.broadcast_every(pgn::EEC1, &EEC1, Duration::from_millis(20))
+            .unwrap();
+        ecu.set_fault(100, 1, Lamp::RedStop).unwrap();
+        run_for(&mut ecu, Duration::from_millis(50));
+
+        ecu.bus().queue(dm13_frame(BroadcastCommand::Stop));
+        ecu.poll().unwrap();
+
+        let dm1_before = dm1_payloads(&ecu).len();
+        let eec1_before = ecu.bus().sent_with_pgn(pgn::EEC1).len();
+        run_for(&mut ecu, Duration::from_millis(1100));
+
+        assert_eq!(
+            ecu.bus().sent_with_pgn(pgn::EEC1).len(),
+            eec1_before,
+            "normal broadcasts must stop"
+        );
+        assert!(
+            dm1_payloads(&ecu).len() > dm1_before,
+            "diagnostics must keep flowing"
+        );
+    }
+
+    #[test]
+    fn a_stop_command_expires_so_an_unplugged_tool_cannot_silence_an_ecu() {
+        let mut ecu = claimed_ecu();
+        ecu.broadcast_every(pgn::EEC1, &EEC1, Duration::from_millis(20))
+            .unwrap();
+
+        // Suspend for a tenth of a second rather than the DM13 default, so the
+        // test does not have to wait five seconds to prove the point.
+        ecu.suspend_broadcasts(Duration::from_millis(100));
+        assert!(ecu.broadcasts_suspended());
+        let before = ecu.bus().sent_with_pgn(pgn::EEC1).len();
+
+        run_for(&mut ecu, Duration::from_millis(400));
+        assert!(!ecu.broadcasts_suspended(), "it must expire on its own");
+        assert!(
+            ecu.bus().sent_with_pgn(pgn::EEC1).len() > before,
+            "transmission must resume without being told to"
+        );
     }
 
     // -----------------------------------------------------------------------

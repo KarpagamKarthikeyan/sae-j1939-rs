@@ -11,13 +11,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Additive throughout: no breaking changes since 0.3.0.
 
-Diagnostics stopped being only a codec. Until now the crate could turn trouble
-codes into bytes and back, which is the whole job for reading someone else's
-faults but not for having your own: an ECU has to remember which faults are
-active, how many times each has occurred, which lamps they light, and when the
-next DM1 is due. Both sides of that exchange now work end to end.
+Two things an ECU does that the crate could not: **have faults of its own**, and
+**publish without being asked**. Diagnostics was a codec — the whole job for
+reading someone else's faults, but not for having your own. And a stack that
+only sends on demand covers the rare case while leaving the common one to the
+application, because a J1939 ECU is mostly a publisher.
 
 ### Added
+
+- `schedule` (core) — **`Schedule<N>`**, periodic transmission. A J1939 ECU is
+  mostly a publisher: engine speed twenty times a second, temperatures once a
+  second, whether or not anyone asked. A stack that could only send on demand
+  covered the rare case and left the common one to the application.
+  - Holds *when* to send, never *what*. A cached periodic payload is a payload
+    that is always one cycle stale, so the caller builds it fresh when the
+    schedule says a group is due.
+  - A stalled loop produces **one** message, not a catch-up burst — a flood of
+    stale copies is worse for the bus and the receiver than a missed sample —
+    while preserving phase, so the average rate does not drift by the length of
+    every hiccup.
+  - `suspend`/`resume` are the receiving end of DM13. A suspension always
+    expires: a tool that says "stop" and is then unplugged must not silence an
+    ECU until the next power cycle.
+- Periodic transmission on the host: `Ecu::broadcast_every`, `send_every`,
+  `update_periodic` (change the value without disturbing the timing),
+  `stop_periodic`, and `periodic()` to read the schedule back. `poll` sends
+  them, so an application loop stays a loop over `poll`.
+- **Priority control**: `Ecu::broadcast_with_priority` and
+  `Ecu::set_periodic_priority`. Everything previously went out at the default
+  priority 6; engine and vehicle data conventionally runs higher so that a burst
+  of diagnostics cannot delay a control input. With this, EEC1 goes out as
+  identifier `0x0CF00480` — what a real engine controller looks like — rather
+  than `0x18F00480`.
+- **DM13 honoured** by `Ecu`: a stop-broadcast command quietens the schedule and
+  a start command releases it. Commands naming only a network this ECU is not on
+  are ignored rather than guessed at. Diagnostics are deliberately *not*
+  suspended — DM13 exists to free bandwidth for diagnostic work, and stopping
+  the diagnostics a tool came for would defeat the purpose.
+- Well-known application-layer PGN constants: `EEC1`, `EEC2`,
+  `ENGINE_TEMPERATURE_1`, `ENGINE_FLUID_LEVEL_PRESSURE_1`, `FUEL_ECONOMY`,
+  `CRUISE_CONTROL_VEHICLE_SPEED`, `VEHICLE_ELECTRICAL_POWER`. Only the groups
+  this crate already decodes — each is the parameter group behind entries in
+  `spn::catalogue`, so every constant is exercised by a test that reads a real
+  payload rather than asserting its own number back.
+- `spn::catalogue::GROUPS` and `for_pgn` — the catalogue indexed by parameter
+  group. An SPN is only meaningful inside its own PGN, so this is the direction
+  a decoder actually needs; the `replay` example now uses it instead of keeping
+  a private copy of the mapping that could drift.
 
 - `fault_log` (core) — **`FaultLog<N>`**, the fault state an ECU reports about
   itself. `no_std`, allocation-free, and owning neither a bus nor a clock, so
@@ -65,18 +105,9 @@ next DM1 is due. Both sides of that exchange now work end to end.
   of a bus.
 - `service_tool` example — the counterpart to `vcan_ecu`: scan a bus, read an
   ECU's readiness, faults, history and software version, and optionally clear.
-- `mcu_node` and `vcan_ecu` examples now drive a real fault lifecycle, including
-  a fault clearing mid-run, instead of a hardcoded payload.
-
-### Fixed
-
-- `Dtc::is_no_fault` recognises the **all-`0xFF`** placeholder as well as the
-  all-zero one. Many ECUs pad a fault-free DM1 with `0xFF`, which decodes to
-  SPN `0x7FFFF` / FMI 31 — neither value assignable — and the crate reported
-  that as a real fault. It also meant `encode`'s own fault-free output did not
-  read back as fault-free.
-
-### Added (previously unreleased)
+- `mcu_node` and `vcan_ecu` now drive a real fault lifecycle *and* broadcast on
+  a schedule, so both examples show an ECU doing what ECUs mostly do rather than
+  replaying a hardcoded payload.
 
 - `log` (host) — read `candump` captures and replay them through the stack.
   Three modules (`etp`, `iso11783::working_set`, `iso11783::task_controller`)
@@ -131,6 +162,14 @@ next DM1 is due. Both sides of that exchange now work end to end.
   `--all-features`, which enables everything at once and so cannot catch a
   feature that breaks only in isolation. Verified by breaking the `defmt` path
   alone: a plain build still passed, and the gate failed.
+
+### Fixed
+
+- `Dtc::is_no_fault` recognises the **all-`0xFF`** placeholder as well as the
+  all-zero one. Many ECUs pad a fault-free DM1 with `0xFF`, which decodes to
+  SPN `0x7FFFF` / FMI 31 — neither value assignable — and the crate reported
+  that as a real fault. It also meant `encode`'s own fault-free output did not
+  read back as fault-free.
 
 ## [0.3.0] - 2026-08-02
 

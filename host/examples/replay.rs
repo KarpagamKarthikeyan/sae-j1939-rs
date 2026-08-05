@@ -30,50 +30,8 @@ use sae_j1939_host::sae_j1939_rs::diagnostics::{
 };
 use sae_j1939_host::sae_j1939_rs::iso11783::task_controller::{Command, ProcessData, PROCESS_DATA};
 use sae_j1939_host::sae_j1939_rs::iso11783::working_set::{WorkingSetMaster, WORKING_SET_MASTER};
-use sae_j1939_host::sae_j1939_rs::spn::{catalogue, Spn, SpnValue};
-use sae_j1939_host::sae_j1939_rs::{pgn, Address, Name, Pgn};
-
-/// Parameters this tool knows how to read, by the PGN that carries them.
-const KNOWN: &[(u32, &[Spn])] = &[
-    (
-        0x00F004,
-        &[
-            catalogue::ENGINE_SPEED,
-            catalogue::ACTUAL_ENGINE_PERCENT_TORQUE,
-            catalogue::DRIVERS_DEMAND_ENGINE_PERCENT_TORQUE,
-        ],
-    ),
-    (
-        0x00F003,
-        &[
-            catalogue::ACCELERATOR_PEDAL_POSITION,
-            catalogue::ENGINE_PERCENT_LOAD,
-        ],
-    ),
-    (
-        0x00FEEE,
-        &[
-            catalogue::ENGINE_COOLANT_TEMPERATURE,
-            catalogue::ENGINE_FUEL_TEMPERATURE,
-            catalogue::ENGINE_OIL_TEMPERATURE,
-        ],
-    ),
-    (
-        0x00FEEF,
-        &[catalogue::ENGINE_OIL_PRESSURE, catalogue::ENGINE_OIL_LEVEL],
-    ),
-    (0x00FEF2, &[catalogue::ENGINE_FUEL_RATE]),
-    (0x00FEF1, &[catalogue::WHEEL_BASED_VEHICLE_SPEED]),
-    (0x00FEF7, &[catalogue::BATTERY_POTENTIAL]),
-];
-
-fn parameters_for(pgn: Pgn) -> &'static [Spn] {
-    KNOWN
-        .iter()
-        .find(|(raw, _)| *raw == pgn.as_u32())
-        .map(|(_, spns)| *spns)
-        .unwrap_or(&[])
-}
+use sae_j1939_host::sae_j1939_rs::spn::{catalogue, SpnValue};
+use sae_j1939_host::sae_j1939_rs::{pgn, Address, Name};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -190,7 +148,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             );
         } else {
-            for spn in parameters_for(message.pgn) {
+            // What the crate knows how to read out of this group. The mapping
+            // lives in the catalogue, not here — a decoder that keeps its own
+            // copy is a decoder that drifts from the definitions it decodes with.
+            for spn in catalogue::for_pgn(message.pgn) {
                 match spn.decode(&message.data) {
                     Ok(SpnValue::Valid(value)) => {
                         println!("    {} = {value:.2} {}", spn.name, spn.unit)

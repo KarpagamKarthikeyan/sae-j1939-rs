@@ -60,6 +60,9 @@ on a microcontroller with no allocator, as well as on a laptop.
 | **An ECU that reports itself**: periodic DM1, and DM1/2/5/3/11 on request | -73 | ✅ |
 | **A tool that reads others**: faults, history, readiness, software version | -73 | ✅ |
 | **Bus inventory and scan**: who is out there, and what NAME they claimed | -81 | ✅ |
+| **Periodic transmission**: broadcast on a schedule, at a chosen priority | -21 | ✅ |
+| **DM13 honoured**: a tool can quieten the bus, and it un-quietens itself | -73 | ✅ |
+| Well-known application PGN constants (EEC1, EEC2, ET1, EFL/P1, LFE, CCVS1, VEP1) | -71 | ✅ |
 | **`Node`**: one type doing claiming, filtering, reassembly, and dispatch | — | ✅ |
 | **`Outgoing`**: one type choosing single-frame vs BAM vs RTS/CTS on the way out | — | ✅ |
 | **`Ecu`**: `Node` on any `Bus` — clock, BAM pacing, RTS/CTS handshake | — | ✅ |
@@ -402,6 +405,41 @@ Re-asserting a live fault is not a new occurrence; a fault that clears and
 returns resumes its count. On the host, `Ecu` owns one of these and drives it
 for you — `set_fault` is all the above.
 
+### Broadcast on a schedule
+
+The other half of what an ECU does. A J1939 ECU is mostly a *publisher*: engine
+speed twenty times a second, temperatures once a second, whether or not anyone
+asked.
+
+```rust
+use std::time::Duration;
+use sae_j1939_host::sae_j1939_rs::{pgn, Priority};
+
+// 1500 rpm, twenty times a second, at the priority engine data arbitrates at.
+ecu.broadcast_every(pgn::EEC1, &eec1, Duration::from_millis(50))?;
+ecu.set_periodic_priority(pgn::EEC1, Address::GLOBAL, Priority::new(3)?)?;
+
+loop {
+    // Publish the new reading; the rate was set once and does not change.
+    ecu.update_periodic(pgn::EEC1, &measure_engine_speed())?;
+    ecu.poll()?;                 // this is what actually sends them
+}
+```
+
+A stalled loop sends **one** message rather than a catch-up burst — a flood of
+stale copies is worse for the bus and for the receiver than a missed sample —
+while keeping the phase, so the average rate does not drift by the length of
+every hiccup.
+
+A service tool can quieten all of it with DM13, and `Ecu` honours that. The
+suspension expires on its own: a tool that says "stop" and is then unplugged
+must not silence an ECU until the next power cycle. Diagnostics keep flowing
+throughout, since freeing bandwidth *for* diagnostic work is the point.
+
+On a microcontroller the same timer lives in `schedule::Schedule<N>`, which
+holds when to send but never what — a cached periodic payload is a payload
+that is always one cycle stale.
+
 ### Bring your own transport
 
 `Ecu` is generic over a two-method `Bus` trait, so it is not tied to SocketCAN or
@@ -494,6 +532,15 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
   runs `FaultLog` → `Outgoing` → a peer's `Reassembler` with no host crate
   involved, at every fault count from one to a full log, so the boundary where a
   DM1 stops fitting one frame is crossed rather than assumed.
+
+- **Periodic transmission is checked end to end.**
+  `core/tests/periodic_transmission.rs` drives `Schedule` → frames → SPN
+  decoding: the rates come out right over ten simulated seconds, the identifier
+  is the one a receiver would see (`0x0CF00400` for EEC1 at priority 3), the
+  payload decodes back to the value that went in, and successive frames differ —
+  a schedule that cached its payload would publish the same stale reading
+  forever. Fields the ECU does not populate must read as *not available* rather
+  than as zero.
 
 - **Replay a real capture, on any platform.** `candump -l can0` on the vehicle,
   then analyse the file anywhere — no CAN interface and no Linux needed:

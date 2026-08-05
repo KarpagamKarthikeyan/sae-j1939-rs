@@ -25,10 +25,12 @@
 
 #[cfg(target_os = "linux")]
 fn main() -> std::io::Result<()> {
+    use std::time::{Duration, Instant};
+
     use sae_j1939_host::ecu::SocketCanEcu;
     use sae_j1939_host::sae_j1939_rs::diagnostics::Lamp;
     use sae_j1939_host::sae_j1939_rs::request::Request;
-    use sae_j1939_host::sae_j1939_rs::{name::industry_group, pgn, Address, Name};
+    use sae_j1939_host::sae_j1939_rs::{name::industry_group, pgn, Address, Name, Priority};
 
     let interface = std::env::args().nth(1).unwrap_or_else(|| "vcan0".into());
 
@@ -69,9 +71,55 @@ fn main() -> std::io::Result<()> {
         ecu.faults().active().len()
     );
 
+    // What a running engine controller actually puts on the bus: parameter
+    // groups broadcast on a schedule, whether or not anyone asked. `poll` sends
+    // them, so the loop below stays a loop over `poll`.
+    ecu.broadcast_every(pgn::EEC1, &engine_speed(1500.0), Duration::from_millis(50))?;
+    // Engine speed is a control input, so it should win arbitration against
+    // diagnostics: priority 3 rather than the default 6. On the bus that is the
+    // difference between identifier 0x0CF00480 and 0x18F00480.
+    ecu.set_periodic_priority(pgn::EEC1, Address::GLOBAL, Priority::new(3).expect("0..=7"))?;
+    ecu.broadcast_every(
+        pgn::ENGINE_TEMPERATURE_1,
+        &coolant_temperature(80),
+        Duration::from_secs(1),
+    )?;
+    println!(
+        "broadcasting {} parameter groups on a schedule",
+        ecu.periodic().count()
+    );
+    // Every network in a DM13 defaults to "do not care" (0b11), so an all-0xFF
+    // payload commands nothing; clearing the low two bits says "stop" to the
+    // data link the message arrived on.
+    println!("quieten this with DM13:  cansend {interface} 18DFFFF9#FCFFFFFFFFFFFFFF");
+    println!("...and start it again:   cansend {interface} 18DFFFF9#FDFFFFFFFFFFFFFF");
+
     let mut reported_healthy = false;
+    let mut suspended = false;
+    let mut rpm = 1500.0f32;
+    let mut next_update = Instant::now();
 
     loop {
+        // A real control loop recomputes its published values. The rate is set
+        // once; only the value changes.
+        if Instant::now() >= next_update {
+            next_update = Instant::now() + Duration::from_millis(100);
+            rpm = if rpm >= 1800.0 { 1200.0 } else { rpm + 25.0 };
+            ecu.update_periodic(pgn::EEC1, &engine_speed(rpm))?;
+        }
+
+        if ecu.broadcasts_suspended() != suspended {
+            suspended = ecu.broadcasts_suspended();
+            println!(
+                "  -> broadcasts {}",
+                if suspended {
+                    "stopped by DM13 (they resume on their own if nobody renews it)"
+                } else {
+                    "running again"
+                }
+            );
+        }
+
         // `poll` returns None on a quiet bus, not at end-of-stream.
         let Some(message) = ecu.poll()? else {
             // A tool may have cleared the codes while we were not looking.
@@ -97,6 +145,31 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
+}
+
+/// Build an EEC1 payload carrying an engine speed.
+///
+/// SPN 190 is a 16-bit little-endian field at byte 4, scaled 0.125 rpm per
+/// count — the same definition `spn::catalogue::ENGINE_SPEED` decodes with, so
+/// a receiver reads back exactly what went in. Everything else is `0xFF`, which
+/// is J1939 for "not available" rather than for zero.
+#[cfg(target_os = "linux")]
+fn engine_speed(rpm: f32) -> [u8; 8] {
+    let raw = (rpm / 0.125) as u16;
+    let mut payload = [0xFFu8; 8];
+    payload[3] = raw as u8;
+    payload[4] = (raw >> 8) as u8;
+    payload
+}
+
+/// Build an ET1 payload carrying a coolant temperature.
+///
+/// SPN 110 is one byte at byte 1, offset -40 °C.
+#[cfg(target_os = "linux")]
+fn coolant_temperature(celsius: i16) -> [u8; 8] {
+    let mut payload = [0xFFu8; 8];
+    payload[0] = (celsius + 40).clamp(0, 250) as u8;
+    payload
 }
 
 #[cfg(not(target_os = "linux"))]

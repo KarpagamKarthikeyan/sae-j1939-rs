@@ -36,6 +36,7 @@ use sae_j1939_rs::diagnostics::Lamp;
 use sae_j1939_rs::fault_log::FaultLog;
 use sae_j1939_rs::node::{Event, Node, Outgoing, ADDRESS_CLAIM_WINDOW_MS};
 use sae_j1939_rs::request::Request;
+use sae_j1939_rs::schedule::Schedule;
 use sae_j1939_rs::{name::industry_group, pgn, Address, Frame, Name};
 
 /// How much memory this ECU gives to reassembling one incoming message.
@@ -58,6 +59,9 @@ const MAX_FAULTS: usize = 8;
 /// code. Fixed at compile time, like everything else here.
 const DM1_BUFFER: usize = 2 + 4 * MAX_FAULTS;
 
+/// How many parameter groups this ECU broadcasts on its own schedule.
+const MAX_PERIODIC: usize = 4;
+
 fn main() {
     // ---- Identity -------------------------------------------------------
     let name = Name::new()
@@ -79,6 +83,16 @@ fn main() {
     faults.set(100, 1, Lamp::RedStop).unwrap(); // oil pressure low
     faults.set(110, 0, Lamp::AmberWarning).unwrap(); // coolant temperature high
 
+    // ---- What this ECU publishes without being asked ---------------------
+    // The other half of an ECU's life. `Schedule` holds only the timing; the
+    // payload is built fresh each time it comes due, because a periodic value
+    // that was cached would be a value that is always one cycle stale.
+    let mut schedule = Schedule::<MAX_PERIODIC>::new();
+    schedule.broadcast_every(pgn::EEC1, 50).unwrap();
+    schedule
+        .broadcast_every(pgn::ENGINE_TEMPERATURE_1, 1000)
+        .unwrap();
+
     // ---- Start up --------------------------------------------------------
     transmit(&can, &node.start());
     println!("claiming address {:#04x}", node.address().as_u8());
@@ -91,6 +105,7 @@ fn main() {
     // arrive from the CAN peripheral.
     let mut asked = false;
     let mut repaired = false;
+    let mut periodic_frames = 0usize;
 
     // ---- Main loop -------------------------------------------------------
     for _ in 0..160 {
@@ -156,6 +171,20 @@ fn main() {
             broadcast_dm1(&can, node.address(), &faults);
         }
 
+        // 5. Everything else this ECU publishes. One timer drives the lot;
+        //    drain it to empty, because more than one may come due at once.
+        if node.has_address() {
+            schedule.tick(tick_ms);
+            while let Some(due) = schedule.next_due() {
+                let payload = match due.pgn {
+                    p if p == pgn::EEC1 => engine_speed(1500.0),
+                    _ => coolant_temperature(80),
+                };
+                transmit_single(&can, due.pgn, node.address(), &payload);
+                periodic_frames += 1;
+            }
+        }
+
         // The oil pressure recovers two seconds in. The code stops being
         // active, becomes history for DM2, and the red lamp goes out.
         if elapsed_ms >= 2000 && !repaired {
@@ -165,7 +194,10 @@ fn main() {
         }
     }
 
-    println!("\n{} frames transmitted", can.sent.borrow().len());
+    println!(
+        "\n{} frames transmitted, {periodic_frames} of them scheduled broadcasts",
+        can.sent.borrow().len()
+    );
 }
 
 /// Broadcast a message, however many frames that takes.
@@ -199,6 +231,35 @@ fn broadcast_dm1(can: &MockCan, source: Address, faults: &FaultLog<MAX_FAULTS>) 
             // delay_ms(50);
         }
     }
+}
+
+/// Broadcast one frame's worth of data. No transport protocol, no allocation:
+/// a periodic parameter group is eight bytes by design.
+fn transmit_single(can: &MockCan, group: sae_j1939_rs::Pgn, source: Address, payload: &[u8; 8]) {
+    use sae_j1939_rs::{Id, Priority};
+
+    // Engine data runs at priority 3 rather than the default 6, so a burst of
+    // diagnostics cannot delay a control input.
+    let id = Id::broadcast(Priority::new(3).expect("0..=7"), group, source);
+    transmit(can, &Frame::from_payload(id, *payload));
+}
+
+/// SPN 190 — Engine Speed: 16 bits at byte 4, 0.125 rpm per count. The same
+/// definition `spn::catalogue::ENGINE_SPEED` decodes with, so a receiver reads
+/// back exactly what went in. `0xFF` elsewhere is J1939 for "not available".
+fn engine_speed(rpm: f32) -> [u8; 8] {
+    let raw = (rpm / 0.125) as u16;
+    let mut payload = [0xFFu8; 8];
+    payload[3] = raw as u8;
+    payload[4] = (raw >> 8) as u8;
+    payload
+}
+
+/// SPN 110 — Engine Coolant Temperature: one byte at byte 1, offset -40 °C.
+fn coolant_temperature(celsius: i16) -> [u8; 8] {
+    let mut payload = [0xFFu8; 8];
+    payload[0] = (celsius + 40).clamp(0, 250) as u8;
+    payload
 }
 
 /// Build a Request frame, as another ECU on the bus would send it.
